@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 from dataclasses import dataclass
 
 import httpx
@@ -55,12 +56,45 @@ async def _pick_video(client: httpx.AsyncClient, vl: dict):
         if u.endswith(".m3u8"):
             guess = u.replace("/hls/", "/720p/").replace(".m3u8", ".mp4")
             try:
-                if (await client.head(guess)).status_code == 200:
+                r = await client.get(
+                    guess,
+                    headers={"User-Agent": UA, "Range": "bytes=0-1",
+                             "Referer": "https://www.pinterest.com/"},
+                )
+                if r.status_code in (200, 206):
                     return guess
             except httpx.HTTPError:
                 pass
             return u  # ffmpeg will convert this
     return None
+
+
+IMG_OK = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+
+
+def _pick_image(images: dict):
+    orig = (images.get("orig") or {}).get("url", "")
+    if orig.lower().endswith(IMG_OK):
+        return orig
+    # original is .heic etc. -> take the largest jpg/png variant instead
+    cands = [v for v in images.values() if v.get("url", "").lower().endswith(IMG_OK)]
+    cands.sort(key=lambda v: v.get("width", 0), reverse=True)
+    if cands:
+        return cands[0]["url"]
+    if orig:
+        return re.sub(r"\.\w+$", ".jpg", orig)
+    return None
+
+
+def _ffmpeg_exe() -> str:
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:  # bundled binary from pip (works on Heroku without buildpack)
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        raise PinError("ffmpeg available nahi hai (pip install imageio-ffmpeg).")
 
 
 def _find_video_list(data: dict):
@@ -98,10 +132,10 @@ async def _via_api(client, pid: str):
         if url:
             return Media("video", url, title, f"https://www.pinterest.com/pin/{pid}/")
 
-    orig = (data.get("images") or {}).get("orig") or {}
-    if orig.get("url"):
-        kind = "gif" if orig["url"].endswith(".gif") else "photo"
-        return Media(kind, orig["url"], title, f"https://www.pinterest.com/pin/{pid}/")
+    img_url = _pick_image(data.get("images") or {})
+    if img_url:
+        kind = "gif" if img_url.lower().endswith(".gif") else "photo"
+        return Media(kind, img_url, title, f"https://www.pinterest.com/pin/{pid}/")
     return None
 
 
@@ -142,7 +176,7 @@ async def download(media: Media, folder: str) -> str:
     if media.url.endswith(".m3u8"):
         path = os.path.join(folder, "pin.mp4")
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-loglevel", "error", "-i", media.url,
+            _ffmpeg_exe(), "-y", "-loglevel", "error", "-user_agent", UA, "-i", media.url,
             "-c", "copy", "-bsf:a", "aac_adtstoasc", path,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
