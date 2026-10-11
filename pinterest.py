@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 from dataclasses import dataclass
+from urllib.parse import urljoin
 
 import httpx
 
@@ -191,13 +192,11 @@ async def _stream_to(client, url: str, path: str, limit: int) -> bool:
     return size > 0
 
 
-async def _run_ffmpeg(url: str, path: str, audio_fix: bool):
-    cmd = [
-        _ffmpeg_exe(), "-y", "-loglevel", "error",
-        "-user_agent", UA,
-        "-headers", "Referer: https://www.pinterest.com/\r\n",
-        "-i", url, "-c", "copy",
-    ]
+async def _run_ffmpeg(src: str, path: str, audio_fix: bool, remote: bool):
+    cmd = [_ffmpeg_exe(), "-y", "-loglevel", "error"]
+    if remote:
+        cmd += ["-user_agent", UA, "-headers", "Referer: https://www.pinterest.com/\r\n"]
+    cmd += ["-i", src, "-c", "copy"]
     if audio_fix:
         cmd += ["-bsf:a", "aac_adtstoasc"]
     cmd.append(path)
@@ -206,7 +205,64 @@ async def _run_ffmpeg(url: str, path: str, audio_fix: bool):
     )
     _, err = await proc.communicate()
     ok = proc.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 0
-    return ok, err.decode(errors="ignore").strip()
+    return ok, f"rc={proc.returncode} {err.decode(errors='ignore').strip()}"
+
+
+async def _hls_to_file(client, url: str, path: str, limit: int) -> bool:
+    """Download an HLS playlist's segments into one file (pure Python)."""
+    r = await client.get(url, headers=HDRS)
+    log.info("m3u8 %s -> HTTP %s (%d bytes)", url, r.status_code, len(r.content))
+    if r.status_code != 200:
+        log.warning("m3u8 body: %s", r.text[:200])
+        return False
+    text = r.text
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+    if any(l.startswith("#EXT-X-STREAM-INF") for l in lines):  # master playlist
+        best, best_bw = None, -1
+        for i, l in enumerate(lines):
+            if l.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
+                m = re.search(r"BANDWIDTH=(\d+)", l)
+                bw = int(m.group(1)) if m else 0
+                if bw > best_bw:
+                    best, best_bw = lines[i + 1], bw
+        return bool(best) and await _hls_to_file(client, urljoin(url, best), path, limit)
+
+    segs = [urljoin(url, l) for l in lines if not l.startswith("#")]
+    if not segs:
+        return False
+    init = re.search(r'#EXT-X-MAP:URI="([^"]+)"', text)
+    size = 0
+    with open(path, "wb") as f:
+        if init:
+            ri = await client.get(urljoin(url, init.group(1)), headers=HDRS)
+            if ri.status_code != 200:
+                return False
+            f.write(ri.content)
+        for i in range(0, len(segs), 8):
+            resps = await asyncio.gather(
+                *(client.get(s, headers=HDRS) for s in segs[i:i + 8])
+            )
+            for rr in resps:
+                if rr.status_code != 200:
+                    log.warning("segment HTTP %s", rr.status_code)
+                    return False
+                size += len(rr.content)
+                if size > limit:
+                    raise PinError(f"File {MAX_FILE_MB}MB se badi hai, Telegram bot bhej nahi sakta.")
+                f.write(rr.content)
+    return size > 0
+
+
+def _mp4_candidates(m3u8: str):
+    stem = re.sub(r"\.m3u8.*$", "", m3u8)
+    stem = re.sub(r"_\w+$", "", stem)  # drop quality suffix if any
+    out = []
+    for folder in ("expMp4", "720p"):
+        base = stem.replace("/hls/", f"/{folder}/")
+        for sfx in ("_720w", "_t1", "_t3", ""):
+            out.append(f"{base}{sfx}.mp4")
+    return out
 
 
 async def download(media: Media, folder: str) -> str:
@@ -214,22 +270,30 @@ async def download(media: Media, folder: str) -> str:
 
     if media.url.endswith(".m3u8"):
         path = os.path.join(folder, "pin.mp4")
+        raw = os.path.join(folder, "pin_raw.ts")
 
-        # 1) direct mp4 (same video, no conversion needed)
-        guess = media.url.replace("/hls/", "/720p/").replace(".m3u8", ".mp4")
         async with httpx.AsyncClient(timeout=120) as client:
-            if await _stream_to(client, guess, path, limit):
-                return path
+            # 1) direct mp4 variants (no conversion needed)
+            for cand in _mp4_candidates(media.url):
+                if await _stream_to(client, cand, path, limit):
+                    return path
 
-        # 2) convert HLS with ffmpeg (with, then without audio bitstream fix)
-        last_err = ""
-        for audio_fix in (True, False):
-            ok, last_err = await _run_ffmpeg(media.url, path, audio_fix)
-            if ok:
-                return path
-            log.error("ffmpeg failed (audio_fix=%s): %s", audio_fix, last_err)
-        short = last_err.splitlines()[-1][:150] if last_err else "unknown error"
-        raise PinError(f"Video convert nahi ho paya: {short}")
+            # 2) download HLS segments in Python, remux locally with ffmpeg
+            if await _hls_to_file(client, media.url, raw, limit):
+                last = ""
+                for audio_fix in (True, False):
+                    ok, last = await _run_ffmpeg(raw, path, audio_fix, remote=False)
+                    if ok:
+                        return path
+                    log.error("ffmpeg remux failed (audio_fix=%s): %s", audio_fix, last)
+                raise PinError(f"Video convert nahi ho paya: {last[:150]}")
+
+        # 3) last resort: let ffmpeg fetch the URL itself
+        ok, last = await _run_ffmpeg(media.url, path, True, remote=True)
+        if ok:
+            return path
+        log.error("ffmpeg remote failed: %s", last)
+        raise PinError(f"Video download nahi ho paya: {last[:150]}")
 
     ext = os.path.splitext(media.url.split("?")[0])[1].lower()
     if ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4"):
