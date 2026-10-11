@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
@@ -20,6 +21,11 @@ PIN_RE = re.compile(
 )
 ID_RE = re.compile(r"/pin/(?:[^/\s?]*--)?(\d+)")
 VIDEO_PREF = ["V_720P", "V_EXP7", "V_EXP6", "V_EXP5", "V_EXP4", "V_EXP3", "V_360P"]
+
+
+log = logging.getLogger("pinbot")
+
+HDRS = {"User-Agent": UA, "Referer": "https://www.pinterest.com/", "Accept": "*/*"}
 
 
 class PinError(Exception):
@@ -170,35 +176,67 @@ async def fetch_media(link: str) -> Media:
         return media
 
 
+async def _stream_to(client, url: str, path: str, limit: int) -> bool:
+    size = 0
+    async with client.stream("GET", url, headers=HDRS) as r:
+        if r.status_code != 200:
+            log.warning("direct download %s -> HTTP %s", url, r.status_code)
+            return False
+        with open(path, "wb") as f:
+            async for chunk in r.aiter_bytes(256 * 1024):
+                size += len(chunk)
+                if size > limit:
+                    raise PinError(f"File {MAX_FILE_MB}MB se badi hai, Telegram bot bhej nahi sakta.")
+                f.write(chunk)
+    return size > 0
+
+
+async def _run_ffmpeg(url: str, path: str, audio_fix: bool):
+    cmd = [
+        _ffmpeg_exe(), "-y", "-loglevel", "error",
+        "-user_agent", UA,
+        "-headers", "Referer: https://www.pinterest.com/\r\n",
+        "-i", url, "-c", "copy",
+    ]
+    if audio_fix:
+        cmd += ["-bsf:a", "aac_adtstoasc"]
+    cmd.append(path)
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+    )
+    _, err = await proc.communicate()
+    ok = proc.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 0
+    return ok, err.decode(errors="ignore").strip()
+
+
 async def download(media: Media, folder: str) -> str:
     limit = MAX_FILE_MB * 1024 * 1024
 
     if media.url.endswith(".m3u8"):
         path = os.path.join(folder, "pin.mp4")
-        proc = await asyncio.create_subprocess_exec(
-            _ffmpeg_exe(), "-y", "-loglevel", "error", "-user_agent", UA, "-i", media.url,
-            "-c", "copy", "-bsf:a", "aac_adtstoasc", path,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-        )
-        await proc.wait()
-        if proc.returncode != 0 or not os.path.exists(path):
-            raise PinError("Video convert nahi ho paya (ffmpeg installed hai?).")
-        return path
+
+        # 1) direct mp4 (same video, no conversion needed)
+        guess = media.url.replace("/hls/", "/720p/").replace(".m3u8", ".mp4")
+        async with httpx.AsyncClient(timeout=120) as client:
+            if await _stream_to(client, guess, path, limit):
+                return path
+
+        # 2) convert HLS with ffmpeg (with, then without audio bitstream fix)
+        last_err = ""
+        for audio_fix in (True, False):
+            ok, last_err = await _run_ffmpeg(media.url, path, audio_fix)
+            if ok:
+                return path
+            log.error("ffmpeg failed (audio_fix=%s): %s", audio_fix, last_err)
+        short = last_err.splitlines()[-1][:150] if last_err else "unknown error"
+        raise PinError(f"Video convert nahi ho paya: {short}")
 
     ext = os.path.splitext(media.url.split("?")[0])[1].lower()
     if ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4"):
         ext = {"video": ".mp4", "photo": ".jpg", "gif": ".gif"}[media.kind]
     path = os.path.join(folder, "pin" + ext)
 
-    size = 0
-    async with httpx.AsyncClient(timeout=120, headers={"User-Agent": UA}) as client:
-        async with client.stream("GET", media.url) as r:
-            if r.status_code != 200:
-                raise PinError("Media download fail ho gaya.")
-            with open(path, "wb") as f:
-                async for chunk in r.aiter_bytes(256 * 1024):
-                    size += len(chunk)
-                    if size > limit:
-                        raise PinError(f"File {MAX_FILE_MB}MB se badi hai, Telegram bot bhej nahi sakta.")
-                    f.write(chunk)
+    async with httpx.AsyncClient(timeout=120) as client:
+        if not await _stream_to(client, media.url, path, limit):
+            raise PinError("Media download fail ho gaya.")
     return path
