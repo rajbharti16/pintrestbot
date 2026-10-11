@@ -10,6 +10,7 @@ from pinterest import PIN_RE, PinError, download, fetch_media
 from tg import Tg, TgError, btn
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # URLs contain the bot token
 log = logging.getLogger("pinbot")
 
 tg = Tg(BOT_TOKEN)
@@ -121,11 +122,18 @@ async def on_message(m: dict):
             method, field = "sendDocument", "document"  # sendPhoto limit is 10MB
 
         extra = {"supports_streaming": True} if media.kind == "video" else {}
-        await tg.call(
-            method, file=(field, path), chat_id=chat_id, caption=caption,
-            parse_mode="HTML", reply_markup=result_kb(media.pin_url),
-            reply_parameters={"message_id": m["message_id"]}, **extra,
+        send_args = dict(
+            chat_id=chat_id, caption=caption, parse_mode="HTML",
+            reply_markup=result_kb(media.pin_url),
+            reply_parameters={"message_id": m["message_id"]},
         )
+        try:
+            await tg.call(method, file=(field, path), **send_args, **extra)
+        except TgError:
+            if method == "sendDocument":
+                raise
+            # e.g. bad photo dimensions/format -> send as a file instead
+            await tg.call("sendDocument", file=("document", path), **send_args)
     except (PinError, TgError) as e:
         await tg.call(
             "sendMessage", chat_id=chat_id, parse_mode="HTML",
