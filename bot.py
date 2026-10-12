@@ -6,6 +6,7 @@ import shutil
 import tempfile
 
 from config import BOT_TOKEN, CHANNEL_URL, MAX_PARALLEL, OWNER_URL, eid, em
+from broadcast import Broadcaster
 from instagram import IG_RE, IGError, fetch_instagram
 from pinterest import PIN_RE, PinError, download, fetch_media
 from tg import Tg, TgError, btn
@@ -15,6 +16,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)  # URLs contain the bot tok
 log = logging.getLogger("pinbot")
 
 tg = Tg(BOT_TOKEN)
+bc = Broadcaster(tg)
 sem = asyncio.Semaphore(MAX_PARALLEL)
 
 
@@ -54,12 +56,12 @@ def help_kb() -> dict:
     return {"inline_keyboard": [[btn("Back", cb="back", style="primary", emoji_id=eid("back"))]]}
 
 
-def result_kb(pin_url: str) -> dict:
+def result_kb(pin_url: str, uid=None) -> dict:
     return {
         "inline_keyboard": [
             [
                 btn("Open Pin", url=pin_url, style="primary", emoji_id=eid("link")),
-                btn("Delete", cb="del", style="danger", emoji_id=eid("delete")),
+                btn("Delete", cb=f"del:{uid}" if uid else "del", style="danger", emoji_id=eid("delete")),
             ]
         ]
     }
@@ -69,6 +71,17 @@ def result_kb(pin_url: str) -> dict:
 async def on_message(m: dict):
     chat_id = m["chat"]["id"]
     text = m.get("text") or m.get("caption") or ""
+    if (m.get("from") or {}).get("is_bot"):
+        return
+    uid = (m.get("from") or {}).get("id")
+    # links hidden behind normal text (hyperlinks) live in the entities
+    for e in (m.get("entities") or []) + (m.get("caption_entities") or []):
+        if e.get("type") == "text_link" and e.get("url"):
+            text += "\n" + e["url"]
+
+    await bc.track(m)  # remember users / groups for broadcast
+    if await bc.handle(m):  # /broadcast, /stats (owner only)
+        return
 
     # helper: send a premium emoji to the bot and it replies with its id
     ids = [
@@ -130,7 +143,7 @@ async def on_message(m: dict):
         extra = {"supports_streaming": True} if media.kind == "video" else {}
         send_args = dict(
             chat_id=chat_id, caption=caption, parse_mode="HTML",
-            reply_markup=result_kb(media.pin_url),
+            reply_markup=result_kb(media.pin_url, uid),
             reply_parameters={"message_id": m["message_id"]},
         )
         try:
@@ -178,6 +191,7 @@ async def send_media(chat_id, kind, path, caption, markup, reply_to):
 
 async def handle_instagram(m: dict, link: str):
     chat_id = m["chat"]["id"]
+    uid = (m.get("from") or {}).get("id")
     wait = await tg.call(
         "sendMessage", chat_id=chat_id, parse_mode="HTML",
         reply_parameters={"message_id": m["message_id"]},
@@ -198,7 +212,7 @@ async def handle_instagram(m: dict, link: str):
             await send_media(
                 chat_id, item.kind, item.path,
                 caption if i == last else None,
-                result_kb(res.url) if i == last else None,
+                result_kb(res.url, uid) if i == last else None,
                 m["message_id"],
             )
     except (IGError, TgError) as e:
@@ -224,11 +238,29 @@ async def on_callback(c: dict):
     msg = c.get("message") or {}
     chat_id, mid = msg.get("chat", {}).get("id"), msg.get("message_id")
     data = c.get("data")
-    await tg.call("answerCallbackQuery", callback_query_id=c["id"])
+    is_del = (data or "").startswith("del")
+    if not is_del:
+        await tg.call("answerCallbackQuery", callback_query_id=c["id"])
     if not chat_id:
         return
-    if data == "del":
-        await tg.call("deleteMessage", chat_id=chat_id, message_id=mid)
+    if is_del:
+        owner = int(data.split(":")[1]) if ":" in data else None
+        clicker = c["from"]["id"]
+        allowed = owner is None or clicker == owner
+        if not allowed and msg["chat"]["type"] != "private":
+            try:
+                member = await tg.call("getChatMember", chat_id=chat_id, user_id=clicker)
+                allowed = member.get("status") in ("creator", "administrator")
+            except TgError:
+                allowed = False
+        if allowed:
+            await tg.call("answerCallbackQuery", callback_query_id=c["id"])
+            await tg.call("deleteMessage", chat_id=chat_id, message_id=mid)
+        else:
+            await tg.call(
+                "answerCallbackQuery", callback_query_id=c["id"], show_alert=True,
+                text="Sirf link bhejne wala ya admin delete kar sakta hai.",
+            )
     elif data == "help":
         await tg.call(
             "editMessageText", chat_id=chat_id, message_id=mid,
@@ -257,7 +289,7 @@ async def main():
         try:
             updates = await tg.call(
                 "getUpdates", offset=offset, timeout=30,
-                allowed_updates=["message", "callback_query"],
+                allowed_updates=["message", "callback_query", "my_chat_member"],
             )
         except Exception as e:
             log.warning("getUpdates failed: %s", e)
@@ -269,8 +301,10 @@ async def main():
                 asyncio.create_task(safe(on_message(u["message"])))
             elif "callback_query" in u:
                 asyncio.create_task(safe(on_callback(u["callback_query"])))
+            elif "my_chat_member" in u:
+                asyncio.create_task(safe(bc.membership(u["my_chat_member"])))
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+                
