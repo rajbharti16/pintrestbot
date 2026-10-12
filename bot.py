@@ -6,6 +6,7 @@ import shutil
 import tempfile
 
 from config import BOT_TOKEN, CHANNEL_URL, MAX_PARALLEL, OWNER_URL, eid, em
+from instagram import IG_RE, IGError, fetch_instagram
 from pinterest import PIN_RE, PinError, download, fetch_media
 from tg import Tg, TgError, btn
 
@@ -20,10 +21,10 @@ sem = asyncio.Semaphore(MAX_PARALLEL)
 # ---------- texts & keyboards ----------
 def start_text() -> str:
     return (
-        f"{em('pin', '📌')} <b>Pinterest Downloader</b>\n\n"
-        f"Koi bhi Pinterest pin ka link bhejo, main video ya photo "
+        f"{em('pin', '📌')} <b>Pinterest + Instagram Downloader</b>\n\n"
+        f"Pinterest pin ya Instagram (reel, post, story) ka link bhejo, main video ya photo "
         f"download karke de dunga {em('fire', '🔥')}\n\n"
-        f"{em('link', '🔗')} <i>pinterest.com / pin.it dono links chalte hain</i>"
+        f"{em('link', '🔗')} <i>pinterest.com, pin.it aur instagram.com links chalte hain</i>"
     )
 
 
@@ -89,12 +90,17 @@ async def on_message(m: dict):
         )
         return
 
+    ig_match = IG_RE.search(text)
+    if ig_match:
+        await handle_instagram(m, ig_match.group(0))
+        return
+
     match = PIN_RE.search(text)
     if not match:
         if m["chat"]["type"] == "private":
             await tg.call(
                 "sendMessage", chat_id=chat_id, parse_mode="HTML",
-                text=f"{em('warn', '⚠️')} Valid Pinterest link bhejo.",
+                text=f"{em('warn', '⚠️')} Pinterest ya Instagram ka valid link bhejo.",
             )
         return
 
@@ -141,6 +147,67 @@ async def on_message(m: dict):
         )
     except Exception:
         log.exception("download failed")
+        await tg.call(
+            "sendMessage", chat_id=chat_id, parse_mode="HTML",
+            text=f"{em('err', '❌')} Kuch gadbad ho gayi, thodi der baad try karo.",
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            await tg.call("deleteMessage", chat_id=chat_id, message_id=wait["message_id"])
+        except TgError:
+            pass
+
+
+async def send_media(chat_id, kind, path, caption, markup, reply_to):
+    method, field = ("sendVideo", "video") if kind == "video" else ("sendPhoto", "photo")
+    if kind == "photo" and os.path.getsize(path) > 10 * 1024 * 1024:
+        method, field = "sendDocument", "document"
+    args = dict(
+        chat_id=chat_id, caption=caption, parse_mode="HTML",
+        reply_markup=markup, reply_parameters={"message_id": reply_to},
+    )
+    extra = {"supports_streaming": True} if kind == "video" else {}
+    try:
+        await tg.call(method, file=(field, path), **args, **extra)
+    except TgError:
+        if method == "sendDocument":
+            raise
+        await tg.call("sendDocument", file=("document", path), **args)
+
+
+async def handle_instagram(m: dict, link: str):
+    chat_id = m["chat"]["id"]
+    wait = await tg.call(
+        "sendMessage", chat_id=chat_id, parse_mode="HTML",
+        reply_parameters={"message_id": m["message_id"]},
+        text=f"{em('load', '⏳')} <b>Processing...</b>",
+    )
+    tmp = tempfile.mkdtemp(prefix="ig_")
+    try:
+        async with sem:
+            res = await fetch_instagram(link, tmp)
+
+        caption = f"{em('ok', '✅')} <b>Downloaded</b>"
+        if res.title:
+            caption += f"\n{html.escape(res.title[:200])}"
+
+        last = len(res.items) - 1
+        for i, item in enumerate(res.items):
+            # caption + buttons only on the last item of a carousel
+            await send_media(
+                chat_id, item.kind, item.path,
+                caption if i == last else None,
+                result_kb(res.url) if i == last else None,
+                m["message_id"],
+            )
+    except (IGError, TgError) as e:
+        await tg.call(
+            "sendMessage", chat_id=chat_id, parse_mode="HTML",
+            text=f"{em('err', '❌')} {html.escape(str(e))}",
+        )
+    except Exception:
+        log.exception("instagram download failed")
         await tg.call(
             "sendMessage", chat_id=chat_id, parse_mode="HTML",
             text=f"{em('err', '❌')} Kuch gadbad ho gayi, thodi der baad try karo.",
@@ -206,3 +273,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
