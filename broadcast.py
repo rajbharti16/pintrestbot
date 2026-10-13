@@ -18,14 +18,11 @@ import logging
 import os
 import re
 
+from config import MONGO_DB, MONGO_URI, OWNER_IDS
 from tg import TgError
 
 log = logging.getLogger("pinbot")
 
-OWNER_IDS = {
-    int(x) for x in re.split(r"[,\s]+", os.getenv("OWNER_ID", "")) if x.strip().isdigit()
-}
-MONGO_URI = os.getenv("MONGO_URI", "").strip()
 DATA_FILE = os.getenv("CHATS_FILE", "chats.json")
 
 # errors that mean "this chat is gone" -> remove it from the list
@@ -55,7 +52,7 @@ class Store:
         if MONGO_URI:
             from pymongo import AsyncMongoClient
 
-            db = AsyncMongoClient(MONGO_URI)[os.getenv("MONGO_DB", "pinbot")]
+            db = AsyncMongoClient(MONGO_URI)[MONGO_DB]
             self.mongo = db["chats"]
         else:
             log.warning("MONGO_URI not set: using %s (restart pe data ud sakta hai)", DATA_FILE)
