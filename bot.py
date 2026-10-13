@@ -17,31 +17,47 @@ log = logging.getLogger("pinbot")
 
 tg = Tg(BOT_TOKEN)
 bc = Broadcaster(tg)
+BOT = {"username": ""}
 sem = asyncio.Semaphore(MAX_PARALLEL)
 
 
 # ---------- texts & keyboards ----------
-def start_text() -> str:
+def start_text(name: str = "") -> str:
+    hi = html.escape(name) if name else "dost"
     return (
-        f"{em('pin', '📌')} <b>Pinterest + Instagram Downloader</b>\n\n"
-        f"Pinterest pin ya Instagram (reel, post, story) ka link bhejo, main video ya photo "
-        f"download karke de dunga {em('fire', '🔥')}\n\n"
-        f"{em('link', '🔗')} <i>pinterest.com, pin.it aur instagram.com links chalte hain</i>"
+        f"{em('pin', '📌')} <b>Media Downloader Bot</b>\n\n"
+        f"Hey <b>{hi}</b> {em('fire', '🔥')}\n"
+        f"Instagram ya Pinterest ka link bhejo, main turant video / photo "
+        f"download karke de dunga.\n\n"
+        f"<blockquote>"
+        f"{em('ok', '✅')} <b>Instagram</b> — Reels, Posts, Stories\n"
+        f"{em('ok', '✅')} <b>Pinterest</b> — Video, Photo, GIF\n"
+        f"{em('ok', '✅')} <b>Groups</b> — link daalo, video turant aa jayegi"
+        f"</blockquote>\n\n"
+        f"{em('link', '🔗')} <i>Bas link paste karo, baaki mujh par chhodo!</i>"
     )
 
 
 def help_text() -> str:
     return (
         f"{em('help', '❓')} <b>Kaise use kare</b>\n\n"
-        f"1. Pinterest app me pin kholo\n"
+        f"1. Instagram ya Pinterest me post / reel / pin kholo\n"
         f"2. <b>Share → Copy link</b> dabao\n"
-        f"3. Link yaha bhej do\n\n"
-        f"{em('ok', '✅')} Video, photo aur GIF teeno support hain."
+        f"3. Link yaha (ya group me) bhej do\n\n"
+        f"{em('ok', '✅')} Video, photo, GIF aur carousel support hain.\n"
+        f"{em('warn', '⚠️')} Story ke liye bot owner ko Instagram session set karna padta hai."
     )
 
 
 def start_kb() -> dict:
-    rows = [[btn("How to use", cb="help", style="primary", emoji_id=eid("help"))]]
+    rows = []
+    if BOT["username"]:
+        rows.append([btn(
+            "Add me to your Group",
+            url=f"https://t.me/{BOT['username']}?startgroup=true",
+            style="success", emoji_id=eid("fire"),
+        )])
+    rows.append([btn("How to use", cb="help", style="primary", emoji_id=eid("help"))])
     extra = []
     if OWNER_URL:
         extra.append(btn("Owner", url=OWNER_URL, style="success", emoji_id=eid("owner")))
@@ -98,7 +114,8 @@ async def on_message(m: dict):
 
     if text.startswith(("/start", "/help")):
         await tg.call(
-            "sendMessage", chat_id=chat_id, text=start_text(),
+            "sendMessage", chat_id=chat_id,
+            text=start_text((m.get("from") or {}).get("first_name", "")),
             parse_mode="HTML", reply_markup=start_kb(),
         )
         return
@@ -269,7 +286,8 @@ async def on_callback(c: dict):
     elif data == "back":
         await tg.call(
             "editMessageText", chat_id=chat_id, message_id=mid,
-            text=start_text(), parse_mode="HTML", reply_markup=start_kb(),
+            text=start_text(c["from"].get("first_name", "")),
+            parse_mode="HTML", reply_markup=start_kb(),
         )
 
 
@@ -282,6 +300,7 @@ async def safe(coro):
 
 async def main():
     me = await tg.call("getMe")
+    BOT["username"] = me["username"]
     await tg.call("deleteWebhook")
     log.info("Started as @%s", me["username"])
     offset = 0
@@ -307,4 +326,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-                
