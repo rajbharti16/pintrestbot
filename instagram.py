@@ -68,8 +68,11 @@ def _cookie_file():
 def _ytdlp(url: str, folder: str, cookies) -> str:
     import yt_dlp
 
+    is_story = "/stories/" in url
+    tmpl = "story_%(id)s.%(ext)s" if is_story else "%(autonumber)s.%(ext)s"
     opts = {
-        "outtmpl": os.path.join(folder, "%(autonumber)s.%(ext)s"),
+        "noplaylist": is_story,  # don't grab every story of the account
+        "outtmpl": os.path.join(folder, tmpl),
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
@@ -89,6 +92,24 @@ def _ytdlp(url: str, folder: str, cookies) -> str:
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True) or {}
     return (info.get("title") or info.get("description") or "").strip()
+
+
+def _img_index(url: str):
+    m = re.search(r"[?&]img_index=(\d+)", url)
+    return int(m.group(1)) if m else None
+
+
+def _only_requested(items, url: str):
+    """Keep only what the link points to (one story / one carousel slide)."""
+    m = re.search(r"/stories/[\w.]+/(\d+)", url)
+    if m:
+        story_id = m.group(1)
+        matched = [i for i in items if story_id in os.path.basename(i.path)]
+        return matched or (items if len(items) == 1 else [])
+    idx = _img_index(url)
+    if idx and len(items) > 1 and 1 <= idx <= len(items):
+        return [items[idx - 1]]
+    return items
 
 
 def _collect(folder: str):
@@ -165,8 +186,10 @@ def _media_id(url: str):
     return int(m.group(1)) if m else None
 
 
-async def _download_item(item: dict, folder: str):
+async def _download_item(item: dict, folder: str, only=None):
     medias = item.get("carousel_media") or [item]
+    if only and len(medias) > 1 and 1 <= only <= len(medias):
+        medias = [medias[only - 1]]
     caption = ((item.get("caption") or {}).get("text") or "").strip()
     limit = MAX_FILE_MB * 1024 * 1024
     out = []
@@ -231,7 +254,7 @@ async def _api_fetch(url: str, folder: str, sid: str):
             except Exception:
                 log.warning("IG API %s -> unexpected body: %s", host, r.text[:150].replace("\n", " "))
                 continue
-            items, title = await _download_item(item, folder)
+            items, title = await _download_item(item, folder, _img_index(url))
             if items:
                 log.info("IG API %s -> %d item(s)", host, len(items))
                 return items, title
@@ -268,11 +291,11 @@ async def fetch_instagram(url: str, folder: str) -> IGResult:
         except Exception as e:  # yt-dlp raises DownloadError and friends
             err = str(e)
             log.warning("yt-dlp failed: %s", err[:300])
-        items = _collect(folder)
+        items = _only_requested(_collect(folder), url)
 
     # 3) public embed page (posts / reels only)
     if not items and not is_story:
-        items = await _embed_fallback(url, folder)
+        items = _only_requested(await _embed_fallback(url, folder), url)
         if not items:
             log.warning("embed fallback found nothing for %s", url)
     if not items:
