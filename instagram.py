@@ -143,6 +143,101 @@ async def _embed_fallback(url: str, folder: str):
         return items
 
 
+IG_APP_ID = "936619743392459"
+MOBILE_UA = (
+    "Instagram 275.0.0.27.98 Android (33/13; 420dpi; 1080x2400; samsung; "
+    "SM-G991B; o1s; exynos2100; en_US; 458229237)"
+)
+_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+
+def _media_id(url: str):
+    m = re.search(r"/(?:p|reel|reels|tv)/([\w-]+)", url)
+    if m:
+        code = m.group(1)[:11]
+        if all(ch in _B64 for ch in code):
+            n = 0
+            for ch in code:
+                n = n * 64 + _B64.index(ch)
+            return n
+        return None
+    m = re.search(r"/stories/[\w.]+/(\d+)", url)
+    return int(m.group(1)) if m else None
+
+
+async def _download_item(item: dict, folder: str):
+    medias = item.get("carousel_media") or [item]
+    caption = ((item.get("caption") or {}).get("text") or "").strip()
+    limit = MAX_FILE_MB * 1024 * 1024
+    out = []
+    async with httpx.AsyncClient(timeout=120, headers={"User-Agent": UA}) as c:
+        for i, mm in enumerate(medias[:MAX_ITEMS]):
+            if mm.get("video_versions"):
+                kind, u, ext = "video", mm["video_versions"][0]["url"], ".mp4"
+            elif (mm.get("image_versions2") or {}).get("candidates"):
+                kind, u, ext = "photo", mm["image_versions2"]["candidates"][0]["url"], ".jpg"
+            else:
+                continue
+            path = os.path.join(folder, f"api_{i:02d}{ext}")
+            size = 0
+            try:
+                async with c.stream("GET", u) as resp:
+                    if resp.status_code != 200:
+                        log.warning("IG cdn download HTTP %s", resp.status_code)
+                        continue
+                    with open(path, "wb") as f:
+                        async for chunk in resp.aiter_bytes(256 * 1024):
+                            size += len(chunk)
+                            if size > limit:
+                                break
+                            f.write(chunk)
+            except httpx.HTTPError as e:
+                log.warning("IG cdn download failed: %s", e)
+                continue
+            if size > limit:
+                os.remove(path)
+                continue
+            out.append(IGItem(kind, path))
+    title = caption.splitlines()[0][:150] if caption else ""
+    return out, title
+
+
+async def _api_fetch(url: str, folder: str, sid: str):
+    """Instagram's own media-info API (works best with a logged-in sessionid)."""
+    mid = _media_id(url)
+    if not mid:
+        return [], ""
+    attempts = [
+        (f"https://i.instagram.com/api/v1/media/{mid}/info/",
+         {"User-Agent": MOBILE_UA, "X-IG-App-ID": IG_APP_ID}),
+        (f"https://www.instagram.com/api/v1/media/{mid}/info/",
+         {"User-Agent": UA, "X-IG-App-ID": IG_APP_ID,
+          "X-Requested-With": "XMLHttpRequest", "Referer": "https://www.instagram.com/"}),
+    ]
+    cookies = {"sessionid": sid} if sid else None
+    async with httpx.AsyncClient(timeout=60, cookies=cookies) as client:
+        for api, headers in attempts:
+            host = api.split("/")[2]
+            try:
+                r = await client.get(api, headers=headers)
+            except httpx.HTTPError as e:
+                log.warning("IG API %s error: %s", host, e)
+                continue
+            if r.status_code != 200:
+                log.warning("IG API %s -> HTTP %s: %s", host, r.status_code, r.text[:150].replace("\n", " "))
+                continue
+            try:
+                item = r.json()["items"][0]
+            except Exception:
+                log.warning("IG API %s -> unexpected body: %s", host, r.text[:150].replace("\n", " "))
+                continue
+            items, title = await _download_item(item, folder)
+            if items:
+                log.info("IG API %s -> %d item(s)", host, len(items))
+                return items, title
+    return [], ""
+
+
 def _friendly(err: str, is_story: bool, has_cookies: bool) -> str:
     low = err.lower()
     if is_story and not has_cookies:
@@ -160,18 +255,27 @@ async def fetch_instagram(url: str, folder: str) -> IGResult:
     if is_story and not cookies:
         raise IGError(_friendly("", True, False))
 
-    title, err = "", ""
-    try:
-        title = await asyncio.to_thread(_ytdlp, url, folder, cookies)
-    except Exception as e:  # yt-dlp raises DownloadError and friends
-        err = str(e)
-        log.warning("yt-dlp failed: %s", err[:300])
+    sid = os.getenv("IG_SESSIONID", "").strip()
+    err = ""
 
-    items = _collect(folder)
+    # 1) Instagram API (uses IG_SESSIONID if set)
+    items, title = await _api_fetch(url, folder, sid)
+
+    # 2) yt-dlp
+    if not items:
+        try:
+            title = await asyncio.to_thread(_ytdlp, url, folder, cookies)
+        except Exception as e:  # yt-dlp raises DownloadError and friends
+            err = str(e)
+            log.warning("yt-dlp failed: %s", err[:300])
+        items = _collect(folder)
+
+    # 3) public embed page (posts / reels only)
     if not items and not is_story:
         items = await _embed_fallback(url, folder)
+        if not items:
+            log.warning("embed fallback found nothing for %s", url)
     if not items:
         raise IGError(_friendly(err, is_story, bool(cookies)))
 
     return IGResult(items=items, title=title, url=url)
-  
