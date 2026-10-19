@@ -52,6 +52,7 @@ class IGResult:
     items: list
     title: str
     url: str
+    total: int = 1  # how many photos/videos the post really has
 
 
 def _cookie_file():
@@ -99,7 +100,7 @@ def _img_index(url: str):
     return int(m.group(1)) if m else None
 
 
-def _only_requested(items, url: str):
+def _only_requested(items, url: str, all_slides: bool = False):
     """Keep only what the link points to (one story / one carousel slide)."""
     m = re.search(r"/stories/[\w.]+/(\d+)", url)
     if m:
@@ -109,6 +110,8 @@ def _only_requested(items, url: str):
     idx = _img_index(url)
     if idx and len(items) > 1 and 1 <= idx <= len(items):
         return [items[idx - 1]]
+    if not all_slides and len(items) > 1:
+        return items[:1]  # link of a carousel post -> just the first photo
     return items
 
 
@@ -186,10 +189,14 @@ def _media_id(url: str):
     return int(m.group(1)) if m else None
 
 
-async def _download_item(item: dict, folder: str, only=None):
+async def _download_item(item: dict, folder: str, only=None, all_slides: bool = False):
     medias = item.get("carousel_media") or [item]
-    if only and len(medias) > 1 and 1 <= only <= len(medias):
-        medias = [medias[only - 1]]
+    total = len(medias)
+    if total > 1:
+        if only and 1 <= only <= total:
+            medias = [medias[only - 1]]
+        elif not all_slides:
+            medias = medias[:1]  # only the first photo unless "all" was asked
     caption = ((item.get("caption") or {}).get("text") or "").strip()
     limit = MAX_FILE_MB * 1024 * 1024
     out = []
@@ -222,14 +229,14 @@ async def _download_item(item: dict, folder: str, only=None):
                 continue
             out.append(IGItem(kind, path))
     title = caption.splitlines()[0][:150] if caption else ""
-    return out, title
+    return out, title, total
 
 
-async def _api_fetch(url: str, folder: str, sid: str):
+async def _api_fetch(url: str, folder: str, sid: str, all_slides: bool = False):
     """Instagram's own media-info API (works best with a logged-in sessionid)."""
     mid = _media_id(url)
     if not mid:
-        return [], ""
+        return [], "", 1
     attempts = [
         (f"https://i.instagram.com/api/v1/media/{mid}/info/",
          {"User-Agent": MOBILE_UA, "X-IG-App-ID": IG_APP_ID}),
@@ -254,11 +261,11 @@ async def _api_fetch(url: str, folder: str, sid: str):
             except Exception:
                 log.warning("IG API %s -> unexpected body: %s", host, r.text[:150].replace("\n", " "))
                 continue
-            items, title = await _download_item(item, folder, _img_index(url))
+            items, title, total = await _download_item(item, folder, _img_index(url), all_slides)
             if items:
-                log.info("IG API %s -> %d item(s)", host, len(items))
-                return items, title
-    return [], ""
+                log.info("IG API %s -> %d item(s) of %d", host, len(items), total)
+                return items, title, total
+    return [], "", 1
 
 
 def _friendly(err: str, is_story: bool, has_cookies: bool) -> str:
@@ -272,7 +279,7 @@ def _friendly(err: str, is_story: bool, has_cookies: bool) -> str:
     return "Is link se media nahi mila (private ya delete ho sakta hai)."
 
 
-async def fetch_instagram(url: str, folder: str) -> IGResult:
+async def fetch_instagram(url: str, folder: str, all_slides: bool = False) -> IGResult:
     cookies = _cookie_file()
     is_story = "/stories/" in url
     if is_story and not cookies:
@@ -282,7 +289,7 @@ async def fetch_instagram(url: str, folder: str) -> IGResult:
     err = ""
 
     # 1) Instagram API (uses IG_SESSIONID if set)
-    items, title = await _api_fetch(url, folder, sid)
+    items, title, total = await _api_fetch(url, folder, sid, all_slides)
 
     # 2) yt-dlp
     if not items:
@@ -291,14 +298,19 @@ async def fetch_instagram(url: str, folder: str) -> IGResult:
         except Exception as e:  # yt-dlp raises DownloadError and friends
             err = str(e)
             log.warning("yt-dlp failed: %s", err[:300])
-        items = _only_requested(_collect(folder), url)
+        found = _collect(folder)
+        total = len(found) or 1
+        items = _only_requested(found, url, all_slides)
 
     # 3) public embed page (posts / reels only)
     if not items and not is_story:
-        items = _only_requested(await _embed_fallback(url, folder), url)
+        found = await _embed_fallback(url, folder)
+        total = len(found) or 1
+        items = _only_requested(found, url, all_slides)
         if not items:
             log.warning("embed fallback found nothing for %s", url)
     if not items:
         raise IGError(_friendly(err, is_story, bool(cookies)))
 
-    return IGResult(items=items, title=title, url=url)
+    return IGResult(items=items, title=title, url=url, total=total)
+                                     
