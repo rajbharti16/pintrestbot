@@ -2,10 +2,12 @@ import asyncio
 import html
 import logging
 import os
+import re
 import shutil
 import tempfile
 
 from config import BOT_TOKEN, CHANNEL_URL, MAX_PARALLEL, OWNER_URL, eid, em
+import youtube as yt
 from broadcast import Broadcaster
 from instagram import IG_RE, IGError, fetch_instagram
 from pinterest import PIN_RE, PinError, download, fetch_media
@@ -27,11 +29,12 @@ def start_text(name: str = "") -> str:
     return (
         f"{em('pin', '📌')} <b>Media Downloader Bot</b>\n\n"
         f"Hey <b>{hi}</b> {em('fire', '🔥')}\n"
-        f"Instagram ya Pinterest ka link bhejo, main turant video / photo "
+        f"Instagram, Pinterest ya YouTube ka link bhejo, main turant video / photo "
         f"download karke de dunga.\n\n"
         f"<blockquote>"
         f"{em('ok', '✅')} <b>Instagram</b> — Reels, Posts, Stories\n"
         f"{em('ok', '✅')} <b>Pinterest</b> — Video, Photo, GIF\n"
+        f"{em('ok', '✅')} <b>YouTube</b> — Video (360p / 720p) aur MP3\n"
         f"{em('ok', '✅')} <b>Groups</b> — link daalo, video turant aa jayegi"
         f"</blockquote>\n\n"
         f"{em('link', '🔗')} <i>Bas link paste karo, baaki mujh par chhodo!</i>"
@@ -120,6 +123,11 @@ async def on_message(m: dict):
         )
         return
 
+    yt_match = yt.YT_RE.search(text)
+    if yt_match:
+        await handle_youtube(m, yt_match.group(0))
+        return
+
     ig_match = IG_RE.search(text)
     if ig_match:
         await handle_instagram(m, ig_match.group(0))
@@ -130,7 +138,7 @@ async def on_message(m: dict):
         if m["chat"]["type"] == "private":
             await tg.call(
                 "sendMessage", chat_id=chat_id, parse_mode="HTML",
-                text=f"{em('warn', '⚠️')} Pinterest ya Instagram ka valid link bhejo.",
+                text=f"{em('warn', '⚠️')} Instagram, Pinterest ya YouTube ka valid link bhejo.",
             )
         return
 
@@ -223,13 +231,22 @@ async def handle_instagram(m: dict, link: str):
         if res.title:
             caption += f"\n{html.escape(res.title[:200])}"
 
+        kb = result_kb(res.url, uid)
+        code = re.search(r"instagram\.com/(?:p|tv)/([\w-]+)", res.url)
+        if res.total > 1 and len(res.items) == 1 and code and "img_index" not in res.url:
+            caption += f"\n<i>Is post me {res.total} photos hain, sirf pehli bheji hai.</i>"
+            kb["inline_keyboard"].append([btn(
+                f"All {min(res.total, 10)} photos", cb=f"igall:{code.group(1)}:{uid or 0}",
+                style="success", emoji_id=eid("ok"),
+            )])
+
         last = len(res.items) - 1
         for i, item in enumerate(res.items):
-            # caption + buttons only on the last item of a carousel
+            # caption + buttons only on the last item
             await send_media(
                 chat_id, item.kind, item.path,
                 caption if i == last else None,
-                result_kb(res.url, uid) if i == last else None,
+                kb if i == last else None,
                 m["message_id"],
             )
     except (IGError, TgError) as e:
@@ -243,6 +260,164 @@ async def handle_instagram(m: dict, link: str):
             "sendMessage", chat_id=chat_id, parse_mode="HTML",
             text=f"{em('err', '❌')} Kuch gadbad ho gayi, thodi der baad try karo.",
         )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            await tg.call("deleteMessage", chat_id=chat_id, message_id=wait["message_id"])
+        except TgError:
+            pass
+
+
+async def handle_youtube(m: dict, link: str):
+    chat_id = m["chat"]["id"]
+    wait = await tg.call(
+        "sendMessage", chat_id=chat_id, parse_mode="HTML",
+        reply_parameters={"message_id": m["message_id"]},
+        text=f"{em('load', '⏳')} <b>Video info la raha hu...</b>",
+    )
+    try:
+        async with sem:
+            info = await yt.get_info(link)
+        text = yt.menu_text(info)
+        reply = {"message_id": m["message_id"], "allow_sending_without_reply": True}
+        try:
+            if not info.thumbnail:
+                raise TgError("no thumbnail")
+            await tg.call(
+                "sendPhoto", chat_id=chat_id, photo=info.thumbnail, caption=text,
+                parse_mode="HTML", reply_markup=yt.menu_kb(info.id), reply_parameters=reply,
+            )
+        except TgError:
+            await tg.call(
+                "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
+                reply_markup=yt.menu_kb(info.id), reply_parameters=reply,
+            )
+    except (yt.YTError, TgError) as e:
+        await tg.call(
+            "sendMessage", chat_id=chat_id, parse_mode="HTML",
+            text=f"{em('err', '❌')} {html.escape(str(e))}",
+        )
+    except Exception:
+        log.exception("youtube info failed")
+        await tg.call(
+            "sendMessage", chat_id=chat_id, parse_mode="HTML",
+            text=f"{em('err', '❌')} Kuch gadbad ho gayi, thodi der baad try karo.",
+        )
+    finally:
+        try:
+            await tg.call("deleteMessage", chat_id=chat_id, message_id=wait["message_id"])
+        except TgError:
+            pass
+
+
+async def youtube_download(c: dict, msg: dict, data: str):
+    try:
+        _, fmt, vid = data.split(":")
+    except ValueError:
+        return
+    chat_id, mid = msg["chat"]["id"], msg["message_id"]
+    if fmt == "x":  # cancel
+        await tg.call("deleteMessage", chat_id=chat_id, message_id=mid)
+        return
+    if fmt not in yt.FORMATS or not re.fullmatch(r"[\w-]{11}", vid):
+        return
+
+    link = f"https://www.youtube.com/watch?v={vid}"
+    label = {"v360": "360p video", "v720": "720p video", "mp3": "MP3"}[fmt]
+    # lock the buttons so it is not clicked twice
+    try:
+        await tg.call("editMessageReplyMarkup", chat_id=chat_id, message_id=mid,
+                      reply_markup={"inline_keyboard": []})
+    except TgError:
+        pass
+    wait = await tg.call(
+        "sendMessage", chat_id=chat_id, parse_mode="HTML",
+        reply_parameters={"message_id": mid},
+        text=f"{em('load', '⏳')} <b>{label} download ho rahi hai...</b>",
+    )
+    orig = (msg.get("reply_to_message") or {}).get("message_id")
+    reply = {"message_id": orig, "allow_sending_without_reply": True} if orig else None
+    tmp = tempfile.mkdtemp(prefix="yt_")
+    try:
+        async with sem:
+            f = await yt.download(vid, fmt, tmp)
+
+        args = dict(
+            chat_id=chat_id, parse_mode="HTML", reply_parameters=reply,
+            caption=f"{em('ok', '✅')} <b>{html.escape(f.title[:200])}</b>",
+            reply_markup=result_kb(link, c["from"]["id"]),
+        )
+        if f.kind == "audio":
+            await tg.call(
+                "sendAudio", file=("audio", f.path), title=f.title[:60],
+                performer=f.uploader[:60], duration=f.duration or None, **args,
+            )
+        else:
+            try:
+                await tg.call(
+                    "sendVideo", file=("video", f.path), duration=f.duration or None,
+                    width=f.width or None, height=f.height or None,
+                    supports_streaming=True, **args,
+                )
+            except TgError:
+                await tg.call("sendDocument", file=("document", f.path), **args)
+        await tg.call("deleteMessage", chat_id=chat_id, message_id=mid)
+    except (yt.YTError, TgError) as e:
+        await tg.call(
+            "sendMessage", chat_id=chat_id, parse_mode="HTML",
+            text=f"{em('err', '❌')} {html.escape(str(e))}",
+        )
+        try:  # bring the buttons back so the user can try another quality
+            await tg.call("editMessageReplyMarkup", chat_id=chat_id, message_id=mid,
+                          reply_markup=yt.menu_kb(vid))
+        except TgError:
+            pass
+    except Exception:
+        log.exception("youtube download failed")
+        await tg.call(
+            "sendMessage", chat_id=chat_id, parse_mode="HTML",
+            text=f"{em('err', '❌')} Kuch gadbad ho gayi, thodi der baad try karo.",
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            await tg.call("deleteMessage", chat_id=chat_id, message_id=wait["message_id"])
+        except TgError:
+            pass
+
+
+async def send_all_slides(msg: dict, data: str):
+    chat_id, mid = msg["chat"]["id"], msg["message_id"]
+    try:
+        _, code, owner = data.split(":")
+    except ValueError:
+        return
+    link = f"https://www.instagram.com/p/{code}/"
+    try:  # remove the button so it is not clicked twice
+        await tg.call(
+            "editMessageReplyMarkup", chat_id=chat_id, message_id=mid,
+            reply_markup=result_kb(link, int(owner) or None),
+        )
+    except TgError:
+        pass
+    wait = await tg.call(
+        "sendMessage", chat_id=chat_id, parse_mode="HTML",
+        reply_parameters={"message_id": mid},
+        text=f"{em('load', '⏳')} <b>Processing...</b>",
+    )
+    tmp = tempfile.mkdtemp(prefix="ig_")
+    try:
+        async with sem:
+            res = await fetch_instagram(link, tmp, all_slides=True)
+        for item in res.items[1:]:  # first one was already sent
+            await send_media(chat_id, item.kind, item.path, None, None, mid)
+    except (IGError, TgError) as e:
+        await tg.call(
+            "sendMessage", chat_id=chat_id, parse_mode="HTML",
+            text=f"{em('err', '❌')} {html.escape(str(e))}",
+        )
+    except Exception:
+        log.exception("instagram all-slides failed")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
         try:
@@ -278,6 +453,10 @@ async def on_callback(c: dict):
                 "answerCallbackQuery", callback_query_id=c["id"], show_alert=True,
                 text="Sirf link bhejne wala ya admin delete kar sakta hai.",
             )
+    elif data and data.startswith("yt:"):
+        await youtube_download(c, msg, data)
+    elif data and data.startswith("igall:"):
+        await send_all_slides(msg, data)
     elif data == "help":
         await tg.call(
             "editMessageText", chat_id=chat_id, message_id=mid,
