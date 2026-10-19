@@ -92,17 +92,35 @@ def menu_kb(vid: str) -> dict:
 
 
 # ---------- yt-dlp plumbing ----------
+def _to_text(data: bytes):
+    for enc in ("utf-8-sig", "utf-16"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
 def _cookie_file():
-    b64 = os.getenv("YT_COOKIES_B64", "").strip()
-    if not b64:
+    """YT_COOKIES_B64 -> cookies.txt. Tolerates plain text / UTF-16 files and
+    ignores a broken value instead of crashing yt-dlp."""
+    raw = os.getenv("YT_COOKIES_B64", "").strip()
+    if not raw:
         return None
-    path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+
     try:
-        with open(path, "wb") as f:
-            f.write(base64.b64decode(b64))
+        data = base64.b64decode(re.sub(r"\s+", "", raw), validate=True)
     except Exception:
-        log.warning("YT_COOKIES_B64 is not valid base64")
+        data = raw.replace("\\n", "\n").replace("\\t", "\t").encode()  # plain text pasted
+
+    text = _to_text(data)
+    if text is None or ("youtube.com" not in text and "google.com" not in text):
+        log.warning("YT_COOKIES_B64 galat hai (valid base64 of cookies.txt nahi), ignore kar raha hu")
         return None
+
+    path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text.replace("\r\n", "\n"))
     return path
 
 
@@ -157,6 +175,8 @@ def format_selector(fmt: str) -> str:
 
 def _friendly(err: str) -> str:
     low = err.lower()
+    if "codec can't decode" in low or "cookie" in low:
+        return "Cookies file kharab hai, owner YT_COOKIES_B64 dobara banaye."
     if "not a bot" in low or "sign in to confirm" in low:
         return "YouTube ne bot detect kar liya. Bot owner ko YT_COOKIES_B64 set karna padega."
     if "javascript runtime" in low or "challenge" in low or "ejs" in low:
@@ -248,3 +268,4 @@ async def download(vid: str, fmt: str, folder: str) -> YTFile:
         width=int(info.get("width") or 0),
         height=int(info.get("height") or 0),
     )
+  
