@@ -18,7 +18,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 
-from config import MAX_FILE_MB, eid, em
+from config import MAX_FILE_MB, MONGO_DB, MONGO_URI, eid, em
 from tg import btn
 
 log = logging.getLogger("pinbot")
@@ -92,6 +92,10 @@ def menu_kb(vid: str) -> dict:
 
 
 # ---------- yt-dlp plumbing ----------
+ENV_COOKIE_PATH = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+OWNER_COOKIE_PATH = os.path.join(tempfile.gettempdir(), "yt_cookies_owner.txt")
+
+
 def _to_text(data: bytes):
     for enc in ("utf-8-sig", "utf-16"):
         try:
@@ -101,27 +105,93 @@ def _to_text(data: bytes):
     return None
 
 
+def normalize_cookies(text: str):
+    """Repair a cookies.txt into strict Netscape format. Returns (text, count) or (None, 0).
+    Fixes: spaces instead of tabs, CRLF, extra comment lines, missing header."""
+    lines = ["# Netscape HTTP Cookie File"]
+    n = 0
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        s = line.strip()
+        if not s or (s.startswith("#") and not s.startswith("#HttpOnly_")):
+            continue
+        parts = line.strip("\n").split("\t")
+        if len(parts) != 7:
+            parts = s.split(None, 6)
+        if (
+            len(parts) != 7
+            or parts[1].strip().upper() not in ("TRUE", "FALSE")
+            or parts[3].strip().upper() not in ("TRUE", "FALSE")
+            or not parts[4].strip().isdigit()
+        ):
+            continue
+        lines.append("\t".join(p.strip() for p in parts))
+        n += 1
+    if n and any("youtube.com" in l or "google.com" in l for l in lines):
+        return "\n".join(lines) + "\n", n
+    return None, 0
+
+
 def _cookie_file():
-    """YT_COOKIES_B64 -> cookies.txt. Tolerates plain text / UTF-16 files and
-    ignores a broken value instead of crashing yt-dlp."""
+    """Cookies saved via /ytcookies win; otherwise YT_COOKIES_B64 (base64 or plain)."""
+    if os.path.exists(OWNER_COOKIE_PATH):
+        return OWNER_COOKIE_PATH
     raw = os.getenv("YT_COOKIES_B64", "").strip()
     if not raw:
         return None
-
     try:
         data = base64.b64decode(re.sub(r"\s+", "", raw), validate=True)
     except Exception:
-        data = raw.replace("\\n", "\n").replace("\\t", "\t").encode()  # plain text pasted
-
+        data = raw.replace("\\n", "\n").replace("\\t", "\t").encode()
     text = _to_text(data)
-    if text is None or ("youtube.com" not in text and "google.com" not in text):
-        log.warning("YT_COOKIES_B64 galat hai (valid base64 of cookies.txt nahi), ignore kar raha hu")
+    clean, _ = normalize_cookies(text) if text else (None, 0)
+    if not clean:
+        log.warning("YT_COOKIES_B64 galat hai, ignore kar raha hu. Bot ko /ytcookies se cookies.txt bhejo.")
         return None
+    with open(ENV_COOKIE_PATH, "w", encoding="utf-8", newline="\n") as f:
+        f.write(clean)
+    return ENV_COOKIE_PATH
 
-    path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text.replace("\r\n", "\n"))
-    return path
+
+_settings_col = None
+
+
+async def _settings():
+    global _settings_col
+    if not MONGO_URI:
+        return None
+    if _settings_col is None:
+        from pymongo import AsyncMongoClient
+        _settings_col = AsyncMongoClient(MONGO_URI)[MONGO_DB]["settings"]
+    return _settings_col
+
+
+def _write_owner_cookies(clean: str):
+    with open(OWNER_COOKIE_PATH, "w", encoding="utf-8", newline="\n") as f:
+        f.write(clean)
+
+
+async def save_cookies(raw: bytes) -> int:
+    """Owner uploads a cookies.txt through the bot (/ytcookies)."""
+    text = _to_text(raw)
+    clean, n = normalize_cookies(text) if text else (None, 0)
+    if not clean:
+        raise YTError("Ye valid cookies.txt nahi lag rahi. youtube.com ki Netscape format cookies chahiye.")
+    _write_owner_cookies(clean)
+    col = await _settings()
+    if col is not None:
+        await col.update_one({"_id": "yt_cookies"}, {"$set": {"data": clean}}, upsert=True)
+    return n
+
+
+async def load_cookies():
+    """On startup: restore cookies saved earlier with /ytcookies."""
+    col = await _settings()
+    if col is None:
+        return
+    doc = await col.find_one({"_id": "yt_cookies"})
+    if doc and doc.get("data"):
+        _write_owner_cookies(doc["data"])
+        log.info("YouTube cookies restored from database")
 
 
 def _ffmpeg_dir():
@@ -176,9 +246,9 @@ def format_selector(fmt: str) -> str:
 def _friendly(err: str) -> str:
     low = err.lower()
     if "codec can't decode" in low or "cookie" in low:
-        return "Cookies file kharab hai, owner YT_COOKIES_B64 dobara banaye."
+        return "Cookies file kharab hai. Owner bot ko /ytcookies ke saath cookies.txt file bheje."
     if "not a bot" in low or "sign in to confirm" in low:
-        return "YouTube ne bot detect kar liya. Bot owner ko YT_COOKIES_B64 set karna padega."
+        return "YouTube ne bot detect kar liya. Bot owner ko /ytcookies se cookies.txt bhejni padegi."
     if "javascript runtime" in low or "challenge" in low or "ejs" in low:
         return "Server pe JS runtime (deno) nahi mila, owner ko requirements me `deno` aur `yt-dlp[default]` daalna hoga."
     if "private" in low or "unavailable" in low or "removed" in low or "terminated" in low:
@@ -268,4 +338,3 @@ async def download(vid: str, fmt: str, folder: str) -> YTFile:
         width=int(info.get("width") or 0),
         height=int(info.get("height") or 0),
     )
-  
