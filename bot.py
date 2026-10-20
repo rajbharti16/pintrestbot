@@ -6,7 +6,7 @@ import re
 import shutil
 import tempfile
 
-from config import BOT_TOKEN, CHANNEL_URL, MAX_PARALLEL, OWNER_URL, eid, em
+from config import BOT_TOKEN, CHANNEL_URL, MAX_PARALLEL, OWNER_IDS, OWNER_URL, eid, em
 import youtube as yt
 from broadcast import Broadcaster
 from instagram import IG_RE, IGError, fetch_instagram
@@ -100,6 +100,8 @@ async def on_message(m: dict):
 
     await bc.track(m)  # remember users / groups for broadcast
     if await bc.handle(m):  # /broadcast, /stats (owner only)
+        return
+    if await handle_ytcookies(m):  # /ytcookies (owner only)
         return
 
     # helper: send a premium emoji to the bot and it replies with its id
@@ -266,6 +268,44 @@ async def handle_instagram(m: dict, link: str):
             await tg.call("deleteMessage", chat_id=chat_id, message_id=wait["message_id"])
         except TgError:
             pass
+
+
+async def handle_ytcookies(m: dict) -> bool:
+    """Owner sends a cookies.txt (as file, with caption or as reply) -> /ytcookies."""
+    text = m.get("text") or m.get("caption") or ""
+    if text.split("@")[0].strip().lower() != "/ytcookies":
+        return False
+    chat_id = m["chat"]["id"]
+    if (m.get("from") or {}).get("id") not in OWNER_IDS:
+        return True
+    if m["chat"]["type"] != "private":
+        await tg.call("sendMessage", chat_id=chat_id, text="Ye command sirf private chat me use karo.")
+        return True
+    doc = m.get("document") or (m.get("reply_to_message") or {}).get("document")
+    if not doc:
+        await tg.call(
+            "sendMessage", chat_id=chat_id,
+            text="cookies.txt file bhejo aur caption me /ytcookies likho (ya file pe reply karke /ytcookies).",
+        )
+        return True
+    try:
+        f = await tg.call("getFile", file_id=doc["file_id"])
+        r = await tg.http.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f['file_path']}")
+        n = await yt.save_cookies(r.content)
+        await tg.call(
+            "sendMessage", chat_id=chat_id, parse_mode="HTML",
+            text=f"{em('ok', '✅')} <b>{n} cookies save ho gayi.</b> Ab YouTube link try karo.",
+        )
+        try:  # don't leave the credentials sitting in the chat
+            await tg.call("deleteMessage", chat_id=chat_id, message_id=m["message_id"])
+        except TgError:
+            pass
+    except (yt.YTError, TgError) as e:
+        await tg.call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+    except Exception:
+        log.exception("ytcookies failed")
+        await tg.call("sendMessage", chat_id=chat_id, text="Cookies save nahi ho payi.")
+    return True
 
 
 async def handle_youtube(m: dict, link: str):
@@ -480,6 +520,10 @@ async def safe(coro):
 async def main():
     me = await tg.call("getMe")
     BOT["username"] = me["username"]
+    try:
+        await yt.load_cookies()
+    except Exception:
+        log.exception("could not load saved YouTube cookies")
     await tg.call("deleteWebhook")
     log.info("Started as @%s", me["username"])
     offset = 0
