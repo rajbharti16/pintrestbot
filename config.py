@@ -11,6 +11,11 @@ CHANNEL_URL = os.getenv("CHANNEL_URL", "")  # e.g. https://t.me/yourchannel
 MAX_FILE_MB = 50                            # Bot API upload limit
 MAX_PARALLEL = int(os.getenv("MAX_PARALLEL", "5"))
 
+# Telegram API credentials from https://my.telegram.org (optional).
+# With them, files bigger than 50MB (up to 2GB) are sent as ONE file.
+API_ID = int(os.getenv("API_ID", "0") or 0)
+API_HASH = os.getenv("API_HASH", "").strip()
+
 # Owner(s) allowed to use /broadcast and /stats.
 # Heroku config: OWNER_ID=123456789   (multiple: 123456789,987654321)
 OWNER_IDS = {
@@ -50,3 +55,4 @@ def em(name: str, fallback: str) -> str:
     if emoji_id:
         return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
     return fallback
+    
