@@ -12,6 +12,7 @@ import asyncio
 import base64
 import html
 import logging
+import math
 import os
 import re
 import shutil
@@ -30,6 +31,8 @@ YT_RE = re.compile(
 )
 ID_RE = re.compile(r"(?:v=|youtu\.be/|shorts/|live/)([\w-]{11})")
 MAX_MIN = int(os.getenv("YT_MAX_MIN", "60"))
+# Files above 50MB are downloaded (up to this size) and sent in parts
+BIG_MAX_MB = int(os.getenv("YT_BIG_MAX_MB", "300"))
 
 FORMATS = {"v360": 360, "v720": 720, "mp3": 0}
 
@@ -297,7 +300,7 @@ def _download_sync(vid: str, fmt: str, folder: str) -> dict:
     opts = _base_opts()
     opts.update({
         "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
-        "max_filesize": MAX_FILE_MB * 1024 * 1024,
+        "max_filesize": BIG_MAX_MB * 1024 * 1024,
         "format": format_selector(fmt),
     })
     if fmt == "mp3":
@@ -324,10 +327,10 @@ async def download(vid: str, fmt: str, folder: str) -> YTFile:
         if os.path.splitext(n)[1].lower() in (".mp4", ".mkv", ".webm", ".mp3", ".m4a")
     ]
     if not files:
-        raise YTError(f"File {MAX_FILE_MB}MB se badi hai ya download nahi hui. Kam quality try karo.")
+        raise YTError(f"Video {BIG_MAX_MB}MB se badi hai ya download nahi hui. 360p ya MP3 try karo.")
     path = max(files, key=os.path.getsize)
-    if os.path.getsize(path) > MAX_FILE_MB * 1024 * 1024:
-        raise YTError(f"File {MAX_FILE_MB}MB se badi hai. Kam quality try karo.")
+    if os.path.getsize(path) > BIG_MAX_MB * 1024 * 1024:
+        raise YTError(f"Video {BIG_MAX_MB}MB se badi hai. 360p ya MP3 try karo.")
 
     return YTFile(
         path=path,
@@ -338,3 +341,43 @@ async def download(vid: str, fmt: str, folder: str) -> YTFile:
         width=int(info.get("width") or 0),
         height=int(info.get("height") or 0),
     )
+
+
+async def split_file(path: str, folder: str, duration: int = 0,
+                     part_mb: int = 47, limit: int = None) -> list:
+    """Cut a big file into playable parts that each fit Telegram's bot upload limit.
+    Uses stream copy (no re-encoding), so it is fast and lossless."""
+    from pinterest import _ffmpeg_exe
+
+    limit = limit or (MAX_FILE_MB * 1024 * 1024 - 1024 * 1024)
+    size = os.path.getsize(path)
+    ext = os.path.splitext(path)[1].lower() or ".mp4"
+    est_parts = max(2, math.ceil(size / (part_mb * 1024 * 1024)))
+    dur = duration or 600
+    factor = 0.85
+
+    for attempt in range(4):
+        seg = max(5, int(dur / est_parts * factor))
+        out_dir = os.path.join(folder, f"parts{attempt}")
+        os.makedirs(out_dir, exist_ok=True)
+        cmd = [
+            _ffmpeg_exe(), "-y", "-loglevel", "error", "-i", path,
+            "-map", "0", "-c", "copy", "-f", "segment",
+            "-segment_time", str(seg), "-reset_timestamps", "1",
+        ]
+        if ext == ".mp4":
+            cmd += ["-segment_format_options", "movflags=+faststart"]
+        cmd.append(os.path.join(out_dir, f"part_%03d{ext}"))
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+        )
+        _, err = await proc.communicate()
+        parts = sorted(os.path.join(out_dir, n) for n in os.listdir(out_dir))
+        if proc.returncode == 0 and parts and all(os.path.getsize(p) <= limit for p in parts):
+            return parts
+        log.warning("split attempt %d: rc=%s parts=%d %s", attempt, proc.returncode, len(parts),
+                    err.decode(errors="ignore")[:200])
+        factor *= 0.7  # parts came out too big -> cut shorter pieces
+    raise YTError("Badi file parts me split nahi ho payi. 360p ya MP3 try karo.")
+  
