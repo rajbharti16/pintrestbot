@@ -6,7 +6,7 @@ import re
 import shutil
 import tempfile
 
-from config import BOT_TOKEN, CHANNEL_URL, MAX_PARALLEL, OWNER_IDS, OWNER_URL, eid, em
+from config import BOT_TOKEN, CHANNEL_URL, MAX_FILE_MB, MAX_PARALLEL, OWNER_IDS, OWNER_URL, eid, em
 import youtube as yt
 from broadcast import Broadcaster
 from instagram import IG_RE, IGError, fetch_instagram
@@ -382,25 +382,45 @@ async def youtube_download(c: dict, msg: dict, data: str):
         async with sem:
             f = await yt.download(vid, fmt, tmp)
 
-        args = dict(
-            chat_id=chat_id, parse_mode="HTML", reply_parameters=reply,
-            caption=f"{em('ok', '✅')} <b>{html.escape(f.title[:200])}</b>",
-            reply_markup=result_kb(link, c["from"]["id"]),
-        )
-        if f.kind == "audio":
-            await tg.call(
-                "sendAudio", file=("audio", f.path), title=f.title[:60],
-                performer=f.uploader[:60], duration=f.duration or None, **args,
-            )
-        else:
+        # Telegram bots can upload max ~50MB per file -> bigger ones go out in parts
+        if os.path.getsize(f.path) > MAX_FILE_MB * 1024 * 1024:
             try:
                 await tg.call(
-                    "sendVideo", file=("video", f.path), duration=f.duration or None,
-                    width=f.width or None, height=f.height or None,
-                    supports_streaming=True, **args,
+                    "editMessageText", chat_id=chat_id, message_id=wait["message_id"],
+                    parse_mode="HTML",
+                    text=f"{em('load', '⏳')} <b>File badi hai, parts me bhej raha hu...</b>",
                 )
             except TgError:
-                await tg.call("sendDocument", file=("document", f.path), **args)
+                pass
+            parts = await yt.split_file(f.path, tmp, f.duration)
+        else:
+            parts = [f.path]
+
+        for i, part in enumerate(parts, 1):
+            single = len(parts) == 1
+            caption = f"{em('ok', '✅')} <b>{html.escape(f.title[:200])}</b>"
+            if not single:
+                caption += f"\n<b>Part {i}/{len(parts)}</b>"
+            args = dict(
+                chat_id=chat_id, parse_mode="HTML", reply_parameters=reply, caption=caption,
+                reply_markup=result_kb(link, c["from"]["id"]) if i == len(parts) else None,
+            )
+            if f.kind == "audio":
+                await tg.call(
+                    "sendAudio", file=("audio", part), title=f.title[:60],
+                    performer=f.uploader[:60],
+                    duration=(f.duration or None) if single else None, **args,
+                )
+            else:
+                try:
+                    await tg.call(
+                        "sendVideo", file=("video", part),
+                        duration=(f.duration or None) if single else None,
+                        width=f.width or None, height=f.height or None,
+                        supports_streaming=True, **args,
+                    )
+                except TgError:
+                    await tg.call("sendDocument", file=("document", part), **args)
         await tg.call("deleteMessage", chat_id=chat_id, message_id=mid)
     except (yt.YTError, TgError) as e:
         await tg.call(
@@ -493,59 +513,4 @@ async def on_callback(c: dict):
                 "answerCallbackQuery", callback_query_id=c["id"], show_alert=True,
                 text="Sirf link bhejne wala ya admin delete kar sakta hai.",
             )
-    elif data and data.startswith("yt:"):
-        await youtube_download(c, msg, data)
-    elif data and data.startswith("igall:"):
-        await send_all_slides(msg, data)
-    elif data == "help":
-        await tg.call(
-            "editMessageText", chat_id=chat_id, message_id=mid,
-            text=help_text(), parse_mode="HTML", reply_markup=help_kb(),
-        )
-    elif data == "back":
-        await tg.call(
-            "editMessageText", chat_id=chat_id, message_id=mid,
-            text=start_text(c["from"].get("first_name", "")),
-            parse_mode="HTML", reply_markup=start_kb(),
-        )
-
-
-async def safe(coro):
-    try:
-        await coro
-    except Exception:
-        log.exception("handler error")
-
-
-async def main():
-    me = await tg.call("getMe")
-    BOT["username"] = me["username"]
-    try:
-        await yt.load_cookies()
-    except Exception:
-        log.exception("could not load saved YouTube cookies")
-    await tg.call("deleteWebhook")
-    log.info("Started as @%s", me["username"])
-    offset = 0
-    while True:
-        try:
-            updates = await tg.call(
-                "getUpdates", offset=offset, timeout=30,
-                allowed_updates=["message", "callback_query", "my_chat_member"],
-            )
-        except Exception as e:
-            log.warning("getUpdates failed: %s", e)
-            await asyncio.sleep(3)
-            continue
-        for u in updates:
-            offset = u["update_id"] + 1
-            if "message" in u:
-                asyncio.create_task(safe(on_message(u["message"])))
-            elif "callback_query" in u:
-                asyncio.create_task(safe(on_callback(u["callback_query"])))
-            elif "my_chat_member" in u:
-                asyncio.create_task(safe(bc.membership(u["my_chat_member"])))
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    elif data and data.startswith("yt:
