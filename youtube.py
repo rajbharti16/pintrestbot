@@ -19,7 +19,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 
-from config import MAX_FILE_MB, MONGO_DB, MONGO_URI, eid, em
+from config import API_HASH, API_ID, MAX_FILE_MB, MONGO_DB, MONGO_URI, eid, em
 from tg import btn
 
 log = logging.getLogger("pinbot")
@@ -32,7 +32,7 @@ YT_RE = re.compile(
 ID_RE = re.compile(r"(?:v=|youtu\.be/|shorts/|live/)([\w-]{11})")
 MAX_MIN = int(os.getenv("YT_MAX_MIN", "60"))
 # Files above 50MB are downloaded (up to this size) and sent in parts
-BIG_MAX_MB = int(os.getenv("YT_BIG_MAX_MB", "300"))
+BIG_MAX_MB = int(os.getenv("YT_BIG_MAX_MB", "1000" if (API_ID and API_HASH) else "300"))
 
 FORMATS = {"v360": 360, "v720": 720, "mp3": 0}
 
