@@ -15,7 +15,6 @@ from dataclasses import dataclass
 import httpx
 
 from config import MAX_FILE_MB
-from youtube import _settings, _to_text, normalize_cookies
 
 log = logging.getLogger("pinbot")
 
@@ -63,7 +62,6 @@ def set_dead_hook(fn):
 def _proxy():
     """Optional: route Instagram requests through a proxy (IG_PROXY=http://user:pass@host:port)."""
     return os.getenv("IG_PROXY", "").strip() or None
-IG_COOKIE_PATH = os.path.join(tempfile.gettempdir(), "ig_cookies_owner.txt")
 
 
 @dataclass
@@ -80,71 +78,41 @@ class IGResult:
     total: int = 1  # how many photos/videos the post really has
 
 
-def _cookie_file():
-    """cookies.txt for yt-dlp: the owner's uploaded file wins over IG_SESSIONID."""
-    if os.path.exists(IG_COOKIE_PATH):
-        return IG_COOKIE_PATH
-    sid = os.getenv("IG_SESSIONID", "").strip()
-    if not sid:
-        return None
-    path = os.path.join(tempfile.gettempdir(), "ig_cookies.txt")
-    with open(path, "w") as f:
-        f.write("# Netscape HTTP Cookie File\n")
-        f.write(f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t{sid}\n")
-    return path
+def _ig_ua() -> str:
+    """Use the SAME user agent as the browser you logged in with (IG_USER_AGENT)."""
+    return os.getenv("IG_USER_AGENT", "").strip() or UA
+
+
+def _env(name: str) -> str:
+    return os.getenv(name, "").strip().strip('"').strip("'")
 
 
 def _cookie_dict():
-    """Cookies for Instagram's API: full browser cookies if uploaded, else sessionid."""
-    if os.path.exists(IG_COOKIE_PATH):
-        out = {}
-        with open(IG_COOKIE_PATH, encoding="utf-8") as f:
-            for line in f:
-                line = line.rstrip("\n")
-                if line.startswith("#HttpOnly_"):
-                    line = line[len("#HttpOnly_"):]
-                elif not line or line.startswith("#"):
-                    continue
-                p = line.split("\t")
-                if len(p) == 7 and "instagram.com" in p[0]:
-                    out[p[5]] = p[6]
-        if out:
-            return out
-    sid = os.getenv("IG_SESSIONID", "").strip()
-    return {"sessionid": sid} if sid else None
+    """Instagram login cookies, all from Heroku config vars:
+    IG_COOKIES    = the whole cookie header copied from the browser (best)
+    IG_SESSIONID  = just the sessionid value (simple)"""
+    jar = {}
+    for part in _env("IG_COOKIES").split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            if k.strip():
+                jar[k.strip()] = v.strip()
+    if _env("IG_SESSIONID"):
+        jar["sessionid"] = _env("IG_SESSIONID")
+    return jar if jar.get("sessionid") else None
 
 
-def _write_cookies(clean: str):
-    with open(IG_COOKIE_PATH, "w", encoding="utf-8", newline="\n") as f:
-        f.write(clean)
-
-
-async def save_cookies(raw: bytes) -> int:
-    """Owner uploads instagram cookies.txt through the bot (/igcookies)."""
-    text = _to_text(raw)
-    clean, n = normalize_cookies(text, ("instagram.com",)) if text else (None, 0)
-    if not clean:
-        raise IGError("Ye valid instagram.com cookies.txt nahi lag rahi (Netscape format chahiye).")
-    if "sessionid" not in clean:
-        raise IGError("Cookies me sessionid nahi mila. Instagram me login karke phir export karo.")
-    _write_cookies(clean)
-    _state["dead"] = False
-    _state["session_dead"] = False
-    col = await _settings()
-    if col is not None:
-        await col.update_one({"_id": "ig_cookies"}, {"$set": {"data": clean}}, upsert=True)
-    return n
-
-
-async def load_cookies():
-    """On startup: restore cookies saved earlier with /igcookies."""
-    col = await _settings()
-    if col is None:
-        return
-    doc = await col.find_one({"_id": "ig_cookies"})
-    if doc and doc.get("data"):
-        _write_cookies(doc["data"])
-        log.info("Instagram cookies restored from database")
+def _cookie_file():
+    """cookies.txt for yt-dlp, built from the env cookies."""
+    jar = _cookie_dict()
+    if not jar:
+        return None
+    path = os.path.join(tempfile.gettempdir(), "ig_cookies.txt")
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("# Netscape HTTP Cookie File\n")
+        for k, v in jar.items():
+            f.write(f".instagram.com\tTRUE\t/\tTRUE\t2147483647\t{k}\t{v}\n")
+    return path
 
 
 def _ytdlp(url: str, folder: str, cookies) -> str:
@@ -161,7 +129,7 @@ def _ytdlp(url: str, folder: str, cookies) -> str:
         "format": "best",
         "max_filesize": MAX_FILE_MB * 1024 * 1024,
         "playlistend": MAX_ITEMS,
-        "http_headers": {"User-Agent": UA},
+        "http_headers": {"User-Agent": _ig_ua()},
     }
     try:  # reuse the bundled ffmpeg if available (merging/remuxing)
         from pinterest import _ffmpeg_exe
@@ -266,6 +234,16 @@ MOBILE_UA = (
 _B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 
 
+def _web_headers(jar) -> dict:
+    h = {
+        "User-Agent": _ig_ua(), "X-IG-App-ID": IG_APP_ID, "Accept": "*/*",
+        "X-Requested-With": "XMLHttpRequest", "Referer": "https://www.instagram.com/",
+    }
+    if jar and jar.get("csrftoken"):
+        h["X-CSRFToken"] = jar["csrftoken"]
+    return h
+
+
 def _media_id(url: str):
     m = re.search(r"/(?:p|reel|reels|tv)/([\w-]+)", url)
     if m:
@@ -328,13 +306,17 @@ async def _api_fetch(url: str, folder: str, jar, all_slides: bool = False):
     mid = _media_id(url)
     if not mid:
         return [], "", 1
-    attempts = [
-        (f"https://i.instagram.com/api/v1/media/{mid}/info/",
-         {"User-Agent": MOBILE_UA, "X-IG-App-ID": IG_APP_ID}),
-        (f"https://www.instagram.com/api/v1/media/{mid}/info/",
-         {"User-Agent": UA, "X-IG-App-ID": IG_APP_ID,
-          "X-Requested-With": "XMLHttpRequest", "Referer": "https://www.instagram.com/"}),
-    ]
+    web = (
+        f"https://www.instagram.com/api/v1/media/{mid}/info/",
+        _web_headers(jar),
+    )
+    mobile = (
+        f"https://i.instagram.com/api/v1/media/{mid}/info/",
+        {"User-Agent": MOBILE_UA, "X-IG-App-ID": IG_APP_ID},
+    )
+    # A browser session must only talk to the web API with the browser's user agent;
+    # mixing it with the Android API looks suspicious and gets sessions logged out.
+    attempts = [web] if jar else [mobile, web]
     async with httpx.AsyncClient(timeout=60, cookies=jar or None, proxy=_proxy()) as client:
         for api, headers in attempts:
             host = api.split("/")[2]
@@ -393,17 +375,20 @@ async def check_session():
     try:
         async with httpx.AsyncClient(timeout=30, cookies=jar, proxy=_proxy()) as client:
             r = await client.get(
-                "https://i.instagram.com/api/v1/accounts/current_user/?edit=true",
-                headers={"User-Agent": MOBILE_UA, "X-IG-App-ID": IG_APP_ID},
+                "https://www.instagram.com/api/v1/accounts/current_user/?edit=true",
+                headers=_web_headers(jar),
             )
     except httpx.HTTPError as e:
-        log.info("IG session check failed to run: %s", e)
+        log.info("IG session check failed to run: %r", e)
         return None
     if r.status_code == 200 and '"user"' in r.text:
         return True
-    if r.status_code in (400, 401, 403) and "login_required" in r.text:
+    dead_marks = ("login_required", "logged_out", "checkpoint_required", "challenge_required")
+    if r.status_code in (301, 302) and "login" in r.headers.get("location", ""):
         return False
-    log.info("IG session check inconclusive: HTTP %s", r.status_code)
+    if r.status_code in (400, 401, 403) and any(m in r.text for m in dead_marks):
+        return False
+    log.info("IG session check inconclusive: HTTP %s %s", r.status_code, r.text[:120].replace("\n", " "))
     return None
 
 
