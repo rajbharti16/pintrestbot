@@ -45,13 +45,32 @@ class IGSessionError(IGError):
     """Instagram rejected our login session (expired / logged out)."""
 
 
-_state = {"dead": False, "session_dead": False}
+_state = {"dead": False, "session_dead": False, "reason": "login"}
 # "dead": the last API call was rejected. "session_dead": we stopped using the session.
 _hooks = {"dead": None}
 _SESSION_MSG = (
     "Instagram login session expire ho gaya. Bot owner ko bata diya gaya hai, "
     "thodi der baad try karo."
 )
+
+
+def _login_wall(r):
+    """Why Instagram refused us: 'login' (session invalid), 'challenge' (needs
+    verification) or None (something else). Works for redirects and JSON errors."""
+    text = r.text[:600].lower()
+    if r.status_code in (301, 302, 303, 307, 308):
+        loc = r.headers.get("location", "").lower()
+        if "challenge" in loc or "checkpoint" in loc:
+            return "challenge"
+        if "login" in loc or "/accounts/" in loc:
+            return "login"
+        return None
+    if r.status_code in (400, 401, 403):
+        if any(k in text for k in ("challenge_required", "checkpoint_required", "consent_required")):
+            return "challenge"
+        if any(k in text for k in ("login_required", "logged_out")):
+            return "login"
+    return None
 
 
 def set_dead_hook(fn):
@@ -326,10 +345,12 @@ async def _api_fetch(url: str, folder: str, jar, all_slides: bool = False):
                 log.warning("IG API %s error: %s", host, e)
                 continue
             if r.status_code != 200:
-                log.warning("IG API %s -> HTTP %s: %s", host, r.status_code, r.text[:150].replace("\n", " "))
-                login_redirect = r.status_code in (301, 302) and "login" in r.headers.get("location", "")
-                if jar and (login_redirect or (r.status_code in (400, 401, 403) and "login_required" in r.text)):
+                log.warning("IG API %s -> HTTP %s location=%s: %s", host, r.status_code,
+                            r.headers.get("location", "")[:120], r.text[:150].replace("\n", " "))
+                wall = _login_wall(r)
+                if jar and wall:
                     _state["dead"] = True  # our session was rejected
+                    _state["reason"] = wall
                 continue
             try:
                 item = r.json()["items"][0]
@@ -362,7 +383,7 @@ async def _fire_dead():
     hook = _hooks["dead"]
     if hook:
         try:
-            await hook()
+            await hook(_state.get("reason"))
         except Exception:
             log.exception("session-dead hook failed")
 
@@ -383,12 +404,12 @@ async def check_session():
         return None
     if r.status_code == 200 and '"user"' in r.text:
         return True
-    dead_marks = ("login_required", "logged_out", "checkpoint_required", "challenge_required")
-    if r.status_code in (301, 302) and "login" in r.headers.get("location", ""):
+    wall = _login_wall(r)
+    if wall:
+        _state["reason"] = wall
         return False
-    if r.status_code in (400, 401, 403) and any(m in r.text for m in dead_marks):
-        return False
-    log.info("IG session check inconclusive: HTTP %s %s", r.status_code, r.text[:120].replace("\n", " "))
+    log.info("IG session check inconclusive: HTTP %s location=%s %s", r.status_code,
+             r.headers.get("location", "")[:120], r.text[:120].replace("\n", " "))
     return None
 
 
