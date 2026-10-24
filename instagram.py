@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import httpx
 
 from config import MAX_FILE_MB
+from youtube import _settings, _to_text, normalize_cookies
 
 log = logging.getLogger("pinbot")
 
@@ -41,6 +42,30 @@ class IGError(Exception):
     pass
 
 
+class IGSessionError(IGError):
+    """Instagram rejected our login session (expired / logged out)."""
+
+
+_state = {"dead": False, "session_dead": False}
+# "dead": the last API call was rejected. "session_dead": we stopped using the session.
+_hooks = {"dead": None}
+_SESSION_MSG = (
+    "Instagram login session expire ho gaya. Bot owner ko bata diya gaya hai, "
+    "thodi der baad try karo."
+)
+
+
+def set_dead_hook(fn):
+    """bot.py registers a coroutine that DMs the owner when the session dies."""
+    _hooks["dead"] = fn
+
+
+def _proxy():
+    """Optional: route Instagram requests through a proxy (IG_PROXY=http://user:pass@host:port)."""
+    return os.getenv("IG_PROXY", "").strip() or None
+IG_COOKIE_PATH = os.path.join(tempfile.gettempdir(), "ig_cookies_owner.txt")
+
+
 @dataclass
 class IGItem:
     kind: str  # video | photo
@@ -56,6 +81,9 @@ class IGResult:
 
 
 def _cookie_file():
+    """cookies.txt for yt-dlp: the owner's uploaded file wins over IG_SESSIONID."""
+    if os.path.exists(IG_COOKIE_PATH):
+        return IG_COOKIE_PATH
     sid = os.getenv("IG_SESSIONID", "").strip()
     if not sid:
         return None
@@ -64,6 +92,59 @@ def _cookie_file():
         f.write("# Netscape HTTP Cookie File\n")
         f.write(f".instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t{sid}\n")
     return path
+
+
+def _cookie_dict():
+    """Cookies for Instagram's API: full browser cookies if uploaded, else sessionid."""
+    if os.path.exists(IG_COOKIE_PATH):
+        out = {}
+        with open(IG_COOKIE_PATH, encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if line.startswith("#HttpOnly_"):
+                    line = line[len("#HttpOnly_"):]
+                elif not line or line.startswith("#"):
+                    continue
+                p = line.split("\t")
+                if len(p) == 7 and "instagram.com" in p[0]:
+                    out[p[5]] = p[6]
+        if out:
+            return out
+    sid = os.getenv("IG_SESSIONID", "").strip()
+    return {"sessionid": sid} if sid else None
+
+
+def _write_cookies(clean: str):
+    with open(IG_COOKIE_PATH, "w", encoding="utf-8", newline="\n") as f:
+        f.write(clean)
+
+
+async def save_cookies(raw: bytes) -> int:
+    """Owner uploads instagram cookies.txt through the bot (/igcookies)."""
+    text = _to_text(raw)
+    clean, n = normalize_cookies(text, ("instagram.com",)) if text else (None, 0)
+    if not clean:
+        raise IGError("Ye valid instagram.com cookies.txt nahi lag rahi (Netscape format chahiye).")
+    if "sessionid" not in clean:
+        raise IGError("Cookies me sessionid nahi mila. Instagram me login karke phir export karo.")
+    _write_cookies(clean)
+    _state["dead"] = False
+    _state["session_dead"] = False
+    col = await _settings()
+    if col is not None:
+        await col.update_one({"_id": "ig_cookies"}, {"$set": {"data": clean}}, upsert=True)
+    return n
+
+
+async def load_cookies():
+    """On startup: restore cookies saved earlier with /igcookies."""
+    col = await _settings()
+    if col is None:
+        return
+    doc = await col.find_one({"_id": "ig_cookies"})
+    if doc and doc.get("data"):
+        _write_cookies(doc["data"])
+        log.info("Instagram cookies restored from database")
 
 
 def _ytdlp(url: str, folder: str, cookies) -> str:
@@ -89,6 +170,8 @@ def _ytdlp(url: str, folder: str, cookies) -> str:
         pass
     if cookies:
         opts["cookiefile"] = cookies
+    if _proxy():
+        opts["proxy"] = _proxy()
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True) or {}
@@ -127,6 +210,14 @@ def _collect(folder: str):
     return items[:MAX_ITEMS]
 
 
+def _embed_video_url(page: str):
+    m = re.search(r'video_url\\*"\s*:\s*\\*"(https:.*?)\\*"', page)
+    if not m:
+        return None
+    u = re.sub(r"\\+u0026", "&", m.group(1)).replace("\\/", "/")
+    return u.replace("\\", "")
+
+
 async def _embed_fallback(url: str, folder: str):
     """Best-effort: public posts expose their media on the embed page."""
     m = re.search(r"instagram\.com/(?:p|reel|reels|tv)/([\w-]+)", url)
@@ -134,7 +225,7 @@ async def _embed_fallback(url: str, folder: str):
         return []
     embed = f"https://www.instagram.com/p/{m.group(1)}/embed/captioned/"
     async with httpx.AsyncClient(timeout=60, follow_redirects=True,
-                                 headers={"User-Agent": UA}) as client:
+                                 headers={"User-Agent": UA}, proxy=_proxy()) as client:
         r = await client.get(embed)
         if r.status_code != 200:
             log.warning("embed page HTTP %s", r.status_code)
@@ -142,9 +233,9 @@ async def _embed_fallback(url: str, folder: str):
         page = r.text
 
         urls = []
-        v = re.search(r'"video_url"\s*:\s*"([^"]+)"', page)
-        if v:
-            urls.append(("video", json.loads(f'"{v.group(1)}"')))
+        vurl = _embed_video_url(page)
+        if vurl:
+            urls.append(("video", vurl))
         else:
             for src in re.findall(
                 r'<img[^>]*class="[^"]*EmbeddedMediaImage[^"]*"[^>]*src="([^"]+)"', page
@@ -232,7 +323,7 @@ async def _download_item(item: dict, folder: str, only=None, all_slides: bool = 
     return out, title, total
 
 
-async def _api_fetch(url: str, folder: str, sid: str, all_slides: bool = False):
+async def _api_fetch(url: str, folder: str, jar, all_slides: bool = False):
     """Instagram's own media-info API (works best with a logged-in sessionid)."""
     mid = _media_id(url)
     if not mid:
@@ -244,8 +335,7 @@ async def _api_fetch(url: str, folder: str, sid: str, all_slides: bool = False):
          {"User-Agent": UA, "X-IG-App-ID": IG_APP_ID,
           "X-Requested-With": "XMLHttpRequest", "Referer": "https://www.instagram.com/"}),
     ]
-    cookies = {"sessionid": sid} if sid else None
-    async with httpx.AsyncClient(timeout=60, cookies=cookies) as client:
+    async with httpx.AsyncClient(timeout=60, cookies=jar or None, proxy=_proxy()) as client:
         for api, headers in attempts:
             host = api.split("/")[2]
             try:
@@ -255,6 +345,9 @@ async def _api_fetch(url: str, folder: str, sid: str, all_slides: bool = False):
                 continue
             if r.status_code != 200:
                 log.warning("IG API %s -> HTTP %s: %s", host, r.status_code, r.text[:150].replace("\n", " "))
+                login_redirect = r.status_code in (301, 302) and "login" in r.headers.get("location", "")
+                if jar and (login_redirect or (r.status_code in (400, 401, 403) and "login_required" in r.text)):
+                    _state["dead"] = True  # our session was rejected
                 continue
             try:
                 item = r.json()["items"][0]
@@ -264,6 +357,7 @@ async def _api_fetch(url: str, folder: str, sid: str, all_slides: bool = False):
             items, title, total = await _download_item(item, folder, _img_index(url), all_slides)
             if items:
                 log.info("IG API %s -> %d item(s) of %d", host, len(items), total)
+                _state["dead"] = False
                 return items, title, total
     return [], "", 1
 
@@ -279,17 +373,82 @@ def _friendly(err: str, is_story: bool, has_cookies: bool) -> str:
     return "Is link se media nahi mila (private ya delete ho sakta hai)."
 
 
+_sem = asyncio.Semaphore(2)  # little parallel traffic -> the login session lives longer
+
+
+async def _fire_dead():
+    hook = _hooks["dead"]
+    if hook:
+        try:
+            await hook()
+        except Exception:
+            log.exception("session-dead hook failed")
+
+
+async def check_session():
+    """True = session works, False = Instagram rejected it, None = unknown / no cookies."""
+    jar = _cookie_dict()
+    if not jar:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=30, cookies=jar, proxy=_proxy()) as client:
+            r = await client.get(
+                "https://i.instagram.com/api/v1/accounts/current_user/?edit=true",
+                headers={"User-Agent": MOBILE_UA, "X-IG-App-ID": IG_APP_ID},
+            )
+    except httpx.HTTPError as e:
+        log.info("IG session check failed to run: %s", e)
+        return None
+    if r.status_code == 200 and '"user"' in r.text:
+        return True
+    if r.status_code in (400, 401, 403) and "login_required" in r.text:
+        return False
+    log.info("IG session check inconclusive: HTTP %s", r.status_code)
+    return None
+
+
+async def watchdog_once():
+    """Called periodically: notices a dead session even when nobody sends a link."""
+    alive = await check_session()
+    if alive is False:
+        if not _state["session_dead"]:
+            log.warning("Instagram session is dead")
+        _state["session_dead"] = True
+        await _fire_dead()
+    elif alive is True and _state["session_dead"]:
+        log.info("Instagram session works again")
+        _state["session_dead"] = False
+
+
 async def fetch_instagram(url: str, folder: str, all_slides: bool = False) -> IGResult:
-    cookies = _cookie_file()
+    async with _sem:
+        return await _fetch(url, folder, all_slides)
+
+
+async def _fetch(url: str, folder: str, all_slides: bool) -> IGResult:
     is_story = "/stories/" in url
-    if is_story and not cookies:
+    cookies = _cookie_file()
+    jar = _cookie_dict()
+    if is_story and not jar:
         raise IGError(_friendly("", True, False))
 
-    sid = os.getenv("IG_SESSIONID", "").strip()
-    err = ""
+    if jar and _state["session_dead"]:
+        if is_story:  # stories need a login, nothing else to try
+            await _fire_dead()
+            raise IGSessionError(_SESSION_MSG)
+        jar = cookies = None  # dead session: public posts / reels are tried without it
 
-    # 1) Instagram API (uses IG_SESSIONID if set)
-    items, title, total = await _api_fetch(url, folder, sid, all_slides)
+    err = ""
+    # 1) Instagram API (with the saved session if it still works)
+    _state["dead"] = False
+    items, title, total = await _api_fetch(url, folder, jar, all_slides)
+    if _state["dead"] and jar:
+        _state["session_dead"] = True
+        await _fire_dead()
+        if is_story:
+            raise IGSessionError(_SESSION_MSG)
+        jar = cookies = None  # drop the dead session and retry as a visitor
+        items, title, total = await _api_fetch(url, folder, None, all_slides)
 
     # 2) yt-dlp
     if not items:
@@ -310,7 +469,8 @@ async def fetch_instagram(url: str, folder: str, all_slides: bool = False) -> IG
         if not items:
             log.warning("embed fallback found nothing for %s", url)
     if not items:
+        if _state["session_dead"]:
+            raise IGSessionError(_SESSION_MSG)
         raise IGError(_friendly(err, is_story, bool(cookies)))
 
     return IGResult(items=items, title=title, url=url, total=total)
-                                     
