@@ -5,12 +5,14 @@ import os
 import re
 import shutil
 import tempfile
+import time
 
 from config import BOT_TOKEN, CHANNEL_URL, MAX_FILE_MB, MAX_PARALLEL, OWNER_IDS, OWNER_URL, eid, em
 import youtube as yt
 from bigupload import BigUploader
 from broadcast import Broadcaster
-from instagram import IG_RE, IGError, fetch_instagram
+import instagram as ig
+from instagram import IG_RE, IGError, IGSessionError, fetch_instagram
 from pinterest import PIN_RE, PinError, download, fetch_media
 from tg import Tg, TgError, btn
 
@@ -218,6 +220,41 @@ async def send_media(chat_id, kind, path, caption, markup, reply_to):
         await tg.call("sendDocument", file=("document", path), **args)
 
 
+_ig_notice = {"t": 0.0}
+
+
+async def notify_ig_session_dead():
+    """DM the owner(s) at most once every 6 hours."""
+    if time.time() - _ig_notice["t"] < 6 * 3600:
+        return
+    _ig_notice["t"] = time.time()
+    for oid in OWNER_IDS:
+        try:
+            await tg.call(
+                "sendMessage", chat_id=oid,
+                text="Instagram session logout / expire ho gaya.\n\n"
+                     "Abhi public reels bina login ke try hongi, par stories band hain.\n"
+                     "Naye cookies bhejo: instagram.com ki cookies.txt file is private chat me "
+                     "bhejo aur caption me /igcookies likho.",
+            )
+        except TgError:
+            pass
+
+
+async def ig_watchdog():
+    """Every hour: check the Instagram session so the owner hears about a logout early."""
+    await asyncio.sleep(30)
+    while True:
+        try:
+            await ig.watchdog_once()
+        except Exception:
+            log.exception("instagram watchdog failed")
+        await asyncio.sleep(3600)
+
+
+bg_tasks = []
+
+
 async def handle_instagram(m: dict, link: str):
     chat_id = m["chat"]["id"]
     uid = (m.get("from") or {}).get("id")
@@ -254,6 +291,8 @@ async def handle_instagram(m: dict, link: str):
                 m["message_id"],
             )
     except (IGError, TgError) as e:
+        if isinstance(e, IGSessionError):
+            await notify_ig_session_dead()
         await tg.call(
             "sendMessage", chat_id=chat_id, parse_mode="HTML",
             text=f"{em('err', '❌')} {html.escape(str(e))}",
@@ -275,7 +314,8 @@ async def handle_instagram(m: dict, link: str):
 async def handle_ytcookies(m: dict) -> bool:
     """Owner sends a cookies.txt (as file, with caption or as reply) -> /ytcookies."""
     text = m.get("text") or m.get("caption") or ""
-    if text.split("@")[0].strip().lower() != "/ytcookies":
+    cmd = text.split("@")[0].strip().lower()
+    if cmd not in ("/ytcookies", "/igcookies"):
         return False
     chat_id = m["chat"]["id"]
     if (m.get("from") or {}).get("id") not in OWNER_IDS:
@@ -287,22 +327,22 @@ async def handle_ytcookies(m: dict) -> bool:
     if not doc:
         await tg.call(
             "sendMessage", chat_id=chat_id,
-            text="cookies.txt file bhejo aur caption me /ytcookies likho (ya file pe reply karke /ytcookies).",
+            text=f"cookies.txt file bhejo aur caption me {cmd} likho (ya file pe reply karke {cmd}).",
         )
         return True
     try:
         f = await tg.call("getFile", file_id=doc["file_id"])
         r = await tg.http.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f['file_path']}")
-        n = await yt.save_cookies(r.content)
+        n = await (ig.save_cookies(r.content) if cmd == "/igcookies" else yt.save_cookies(r.content))
         await tg.call(
             "sendMessage", chat_id=chat_id, parse_mode="HTML",
-            text=f"{em('ok', '✅')} <b>{n} cookies save ho gayi.</b> Ab YouTube link try karo.",
+            text=f"{em('ok', '✅')} <b>{n} cookies save ho gayi.</b> Ab link try karo.",
         )
         try:  # don't leave the credentials sitting in the chat
             await tg.call("deleteMessage", chat_id=chat_id, message_id=m["message_id"])
         except TgError:
             pass
-    except (yt.YTError, TgError) as e:
+    except (yt.YTError, IGError, TgError) as e:
         await tg.call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
     except Exception:
         log.exception("ytcookies failed")
@@ -584,10 +624,13 @@ async def main():
         log.exception("MTProto uploader failed to start, big files will go in parts")
     try:
         await yt.load_cookies()
+        await ig.load_cookies()
     except Exception:
         log.exception("could not load saved YouTube cookies")
     await tg.call("deleteWebhook")
     log.info("Started as @%s", me["username"])
+    ig.set_dead_hook(notify_ig_session_dead)
+    bg_tasks.append(asyncio.create_task(ig_watchdog()))
     offset = 0
     while True:
         try:
