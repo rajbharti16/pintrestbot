@@ -234,8 +234,8 @@ async def notify_ig_session_dead():
                 "sendMessage", chat_id=oid,
                 text="Instagram session logout / expire ho gaya.\n\n"
                      "Abhi public reels bina login ke try hongi, par stories band hain.\n"
-                     "Naye cookies bhejo: instagram.com ki cookies.txt file is private chat me "
-                     "bhejo aur caption me /igcookies likho.",
+                     "Naya login do: Heroku -> Settings -> Config Vars me IG_COOKIES "
+                     "(ya IG_SESSIONID) update karo. Dyno khud restart ho jayega.",
             )
         except TgError:
             pass
@@ -315,7 +315,7 @@ async def handle_ytcookies(m: dict) -> bool:
     """Owner sends a cookies.txt (as file, with caption or as reply) -> /ytcookies."""
     text = m.get("text") or m.get("caption") or ""
     cmd = text.split("@")[0].strip().lower()
-    if cmd not in ("/ytcookies", "/igcookies"):
+    if cmd != "/ytcookies":
         return False
     chat_id = m["chat"]["id"]
     if (m.get("from") or {}).get("id") not in OWNER_IDS:
@@ -333,7 +333,7 @@ async def handle_ytcookies(m: dict) -> bool:
     try:
         f = await tg.call("getFile", file_id=doc["file_id"])
         r = await tg.http.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{f['file_path']}")
-        n = await (ig.save_cookies(r.content) if cmd == "/igcookies" else yt.save_cookies(r.content))
+        n = await yt.save_cookies(r.content)
         await tg.call(
             "sendMessage", chat_id=chat_id, parse_mode="HTML",
             text=f"{em('ok', '✅')} <b>{n} cookies save ho gayi.</b> Ab link try karo.",
@@ -342,7 +342,7 @@ async def handle_ytcookies(m: dict) -> bool:
             await tg.call("deleteMessage", chat_id=chat_id, message_id=m["message_id"])
         except TgError:
             pass
-    except (yt.YTError, IGError, TgError) as e:
+    except (yt.YTError, TgError) as e:
         await tg.call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
     except Exception:
         log.exception("ytcookies failed")
@@ -624,7 +624,6 @@ async def main():
         log.exception("MTProto uploader failed to start, big files will go in parts")
     try:
         await yt.load_cookies()
-        await ig.load_cookies()
     except Exception:
         log.exception("could not load saved YouTube cookies")
     await tg.call("deleteWebhook")
@@ -639,7 +638,7 @@ async def main():
                 allowed_updates=["message", "callback_query", "my_chat_member"],
             )
         except Exception as e:
-            log.warning("getUpdates failed: %s", e)
+            log.warning("getUpdates failed: %r", e)
             await asyncio.sleep(3)
             continue
         for u in updates:
