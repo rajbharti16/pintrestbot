@@ -21,6 +21,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)  # URLs contain the bot tok
 log = logging.getLogger("pinbot")
 
 tg = Tg(BOT_TOKEN)
+BUILD = "2026-10-24-ig-env-v3"  # shows in the logs so you can confirm which code is deployed
 bc = Broadcaster(tg)
 big = BigUploader()
 BOT = {"username": ""}
@@ -223,16 +224,23 @@ async def send_media(chat_id, kind, path, caption, markup, reply_to):
 _ig_notice = {"t": 0.0}
 
 
-async def notify_ig_session_dead():
+async def notify_ig_session_dead(reason=None):
     """DM the owner(s) at most once every 6 hours."""
     if time.time() - _ig_notice["t"] < 6 * 3600:
         return
     _ig_notice["t"] = time.time()
+    if reason == "challenge":
+        text = ("Instagram ne account pe verification (challenge) maanga hai.\n\n"
+                "Us dummy account ko browser ya phone me kholo aur 'This was me' confirm karo. "
+                "Phir naya login do: Heroku -> Settings -> Config Vars me IG_COOKIES "
+                "(ya IG_SESSIONID) update karo.")
+    else:
+        text = None
     for oid in OWNER_IDS:
         try:
             await tg.call(
                 "sendMessage", chat_id=oid,
-                text="Instagram session logout / expire ho gaya.\n\n"
+                text=text or "Instagram session logout / expire ho gaya.\n\n"
                      "Abhi public reels bina login ke try hongi, par stories band hain.\n"
                      "Naya login do: Heroku -> Settings -> Config Vars me IG_COOKIES "
                      "(ya IG_SESSIONID) update karo. Dyno khud restart ho jayega.",
@@ -627,7 +635,7 @@ async def main():
     except Exception:
         log.exception("could not load saved YouTube cookies")
     await tg.call("deleteWebhook")
-    log.info("Started as @%s", me["username"])
+    log.info("Started as @%s (build %s)", me["username"], BUILD)
     ig.set_dead_hook(notify_ig_session_dead)
     bg_tasks.append(asyncio.create_task(ig_watchdog()))
     offset = 0
@@ -638,8 +646,13 @@ async def main():
                 allowed_updates=["message", "callback_query", "my_chat_member"],
             )
         except Exception as e:
-            log.warning("getUpdates failed: %r", e)
-            await asyncio.sleep(3)
+            if "Conflict" in str(e):
+                log.warning("Is bot token ka doosra instance bhi chal raha hai (Conflict). "
+                            "Doosra band karo; 10 sec baad dobara try karunga.")
+                await asyncio.sleep(10)
+            else:
+                log.warning("getUpdates failed: %r", e)
+                await asyncio.sleep(3)
             continue
         for u in updates:
             offset = u["update_id"] + 1
