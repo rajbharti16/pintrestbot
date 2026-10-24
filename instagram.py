@@ -58,6 +58,11 @@ def _login_wall(r):
     """Why Instagram refused us: 'login' (session invalid), 'challenge' (needs
     verification) or None (something else). Works for redirects and JSON errors."""
     text = r.text[:600].lower()
+    final = str(getattr(r, "url", "")).lower()
+    if "/challenge" in final or "checkpoint" in final:
+        return "challenge"
+    if "/accounts/login" in final:
+        return "login"
     if r.status_code in (301, 302, 303, 307, 308):
         loc = r.headers.get("location", "").lower()
         if "challenge" in loc or "checkpoint" in loc:
@@ -229,6 +234,8 @@ async def _embed_fallback(url: str, folder: str):
             ):
                 urls.append(("photo", html.unescape(src)))
 
+        if not urls:
+            log.warning("embed page has no media (%d bytes)", len(page))
         items = []
         for i, (kind, u) in enumerate(urls[:MAX_ITEMS]):
             path = os.path.join(folder, f"embed_{i}{'.mp4' if kind == 'video' else '.jpg'}")
@@ -257,6 +264,8 @@ def _web_headers(jar) -> dict:
     h = {
         "User-Agent": _ig_ua(), "X-IG-App-ID": IG_APP_ID, "Accept": "*/*",
         "X-Requested-With": "XMLHttpRequest", "Referer": "https://www.instagram.com/",
+        "Accept-Language": "en-US,en;q=0.9", "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin",
     }
     if jar and jar.get("csrftoken"):
         h["X-CSRFToken"] = jar["csrftoken"]
@@ -336,7 +345,8 @@ async def _api_fetch(url: str, folder: str, jar, all_slides: bool = False):
     # A browser session must only talk to the web API with the browser's user agent;
     # mixing it with the Android API looks suspicious and gets sessions logged out.
     attempts = [web] if jar else [mobile, web]
-    async with httpx.AsyncClient(timeout=60, cookies=jar or None, proxy=_proxy()) as client:
+    async with httpx.AsyncClient(timeout=60, cookies=jar or None, proxy=_proxy(),
+                                 follow_redirects=True, max_redirects=4) as client:
         for api, headers in attempts:
             host = api.split("/")[2]
             try:
@@ -345,8 +355,9 @@ async def _api_fetch(url: str, folder: str, jar, all_slides: bool = False):
                 log.warning("IG API %s error: %s", host, e)
                 continue
             if r.status_code != 200:
-                log.warning("IG API %s -> HTTP %s location=%s: %s", host, r.status_code,
-                            r.headers.get("location", "")[:120], r.text[:150].replace("\n", " "))
+                log.warning("IG API %s -> HTTP %s final=%s location=%s: %s", host, r.status_code,
+                            str(r.url)[:120], r.headers.get("location", "")[:120],
+                            r.text[:150].replace("\n", " "))
                 wall = _login_wall(r)
                 if jar and wall:
                     _state["dead"] = True  # our session was rejected
@@ -355,7 +366,12 @@ async def _api_fetch(url: str, folder: str, jar, all_slides: bool = False):
             try:
                 item = r.json()["items"][0]
             except Exception:
-                log.warning("IG API %s -> unexpected body: %s", host, r.text[:150].replace("\n", " "))
+                log.warning("IG API %s -> not JSON (final=%s): %s", host, str(r.url)[:120],
+                            r.text[:100].replace("\n", " "))
+                wall = _login_wall(r)
+                if jar and wall:
+                    _state["dead"] = True
+                    _state["reason"] = wall
                 continue
             items, title, total = await _download_item(item, folder, _img_index(url), all_slides)
             if items:
@@ -363,6 +379,61 @@ async def _api_fetch(url: str, folder: str, jar, all_slides: bool = False):
                 _state["dead"] = False
                 return items, title, total
     return [], "", 1
+
+
+async def _html_fetch(url: str, folder: str, jar):
+    """Read the post page itself: og:video / og:image describe exactly this post."""
+    m = re.search(r"instagram\.com/(?:p|reel|reels|tv)/([\w-]+)", url)
+    if not m:
+        return [], "", 1
+    page_url = f"https://www.instagram.com/p/{m.group(1)}/"
+    headers = {
+        "User-Agent": _ig_ua(), "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "none",
+    }
+    async with httpx.AsyncClient(timeout=60, cookies=jar or None, proxy=_proxy(),
+                                 follow_redirects=True, max_redirects=4) as client:
+        try:
+            r = await client.get(page_url, headers=headers)
+        except httpx.HTTPError as e:
+            log.warning("IG page error: %r", e)
+            return [], "", 1
+    page = r.text
+    if r.status_code != 200:
+        log.warning("IG page -> HTTP %s final=%s", r.status_code, str(r.url)[:120])
+        return [], "", 1
+
+    def meta(prop):
+        mm = re.search(r'<meta[^>]+property="%s"[^>]+content="([^"]+)"' % re.escape(prop), page)
+        return html.unescape(mm.group(1)) if mm else None
+
+    video = meta("og:video") or meta("og:video:secure_url")
+    image = meta("og:image")
+    kind, media_url = ("video", video) if video else (("photo", image) if image else (None, None))
+    if not media_url:
+        log.warning("IG page has no og:video/og:image (final=%s, %d bytes)", str(r.url)[:100], len(page))
+        return [], "", 1
+    title = (meta("og:title") or "")[:150]
+    path = os.path.join(folder, "page_00" + (".mp4" if kind == "video" else ".jpg"))
+    limit = MAX_FILE_MB * 1024 * 1024
+    size = 0
+    async with httpx.AsyncClient(timeout=120, headers={"User-Agent": UA}) as c:
+        try:
+            async with c.stream("GET", media_url) as resp:
+                if resp.status_code != 200:
+                    return [], "", 1
+                with open(path, "wb") as f:
+                    async for chunk in resp.aiter_bytes(256 * 1024):
+                        size += len(chunk)
+                        if size > limit:
+                            return [], "", 1
+                        f.write(chunk)
+        except httpx.HTTPError as e:
+            log.warning("IG page media download failed: %r", e)
+            return [], "", 1
+    log.info("IG page -> %s via og tags", kind)
+    return [IGItem(kind, path)], title, 1
 
 
 def _friendly(err: str, is_story: bool, has_cookies: bool) -> str:
@@ -455,6 +526,10 @@ async def _fetch(url: str, folder: str, all_slides: bool) -> IGResult:
             raise IGSessionError(_SESSION_MSG)
         jar = cookies = None  # drop the dead session and retry as a visitor
         items, title, total = await _api_fetch(url, folder, None, all_slides)
+
+    # 1b) the post page's own meta tags
+    if not items and not is_story:
+        items, title, total = await _html_fetch(url, folder, jar)
 
     # 2) yt-dlp
     if not items:
