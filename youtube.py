@@ -1,4 +1,7 @@
-"""YouTube downloader: video (360p / 720p) and MP3, via yt-dlp.
+"""YouTube downloader: video and MP3.
+
+Download order: 1) your download API (API_URL + API_KEY, no cookies needed)
+                2) yt-dlp fallback (cookies optional, via /ytcookies)
 
 Flow: user sends a link -> bot shows title + thumbnail with quality buttons ->
 user taps a button -> bot downloads and sends the file.
@@ -19,6 +22,8 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 
+import httpx
+
 from config import API_HASH, API_ID, MAX_FILE_MB, MONGO_DB, MONGO_URI, eid, em
 from tg import btn
 
@@ -32,6 +37,10 @@ YT_RE = re.compile(
 ID_RE = re.compile(r"(?:v=|youtu\.be/|shorts/|live/)([\w-]{11})")
 MAX_MIN = int(os.getenv("YT_MAX_MIN", "60"))
 # Files above 50MB are downloaded (up to this size) and sent in parts
+# Download API (same idea as a music bot's YouTube.py). Heroku Config Vars:
+#   API_URL=https://your-api-host      API_KEY=your-key
+API_URL = os.getenv("API_URL", "").strip().rstrip("/")
+API_KEY = os.getenv("API_KEY", "").strip()
 BIG_MAX_MB = int(os.getenv("YT_BIG_MAX_MB", "1000" if (API_ID and API_HASH) else "300"))
 
 FORMATS = {"v360": 360, "v720": 720, "mp3": 0}
@@ -108,7 +117,7 @@ def _to_text(data: bytes):
     return None
 
 
-def normalize_cookies(text: str):
+def normalize_cookies(text: str, domains=("youtube.com", "google.com")):
     """Repair a cookies.txt into strict Netscape format. Returns (text, count) or (None, 0).
     Fixes: spaces instead of tabs, CRLF, extra comment lines, missing header."""
     lines = ["# Netscape HTTP Cookie File"]
@@ -129,7 +138,7 @@ def normalize_cookies(text: str):
             continue
         lines.append("\t".join(p.strip() for p in parts))
         n += 1
-    if n and any("youtube.com" in l or "google.com" in l for l in lines):
+    if n and any(d in l for l in lines for d in domains):
         return "\n".join(lines) + "\n", n
     return None, 0
 
@@ -272,26 +281,99 @@ def _info_sync(url: str) -> dict:
         return ydl.extract_info(url, download=False)
 
 
-async def get_info(url: str) -> YTInfo:
+def _thumb(vid: str) -> str:
+    return f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+
+
+async def _api_details(vid: str):
+    if not API_URL:
+        return None
+    params = {"link": f"https://www.youtube.com/watch?v={vid}"}
+    if API_KEY:
+        params["api_key"] = API_KEY
     try:
-        info = await asyncio.to_thread(_info_sync, url)
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
+            r = await c.get(f"{API_URL}/details", params=params)
+        if r.status_code == 200:
+            d = r.json()
+            if d and d.get("title"):
+                return d
+        log.warning("API /details -> HTTP %s", r.status_code)
+    except Exception as e:
+        log.warning("API /details failed: %r", e)
+    return None
+
+
+async def _api_info(vid: str):
+    d = await _api_details(vid)
+    if not d:
+        return None
+    return YTInfo(
+        id=d.get("vidid") or vid,
+        title=d.get("title") or "YouTube video",
+        uploader="",
+        duration=int(d.get("duration_sec") or 0),
+        thumbnail=d.get("thumbnail") or _thumb(vid),
+    )
+
+
+async def _oembed_info(vid: str):
+    """Public oEmbed: title/channel/thumbnail without any login (duration unknown)."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(
+                "https://www.youtube.com/oembed",
+                params={"url": f"https://www.youtube.com/watch?v={vid}", "format": "json"},
+            )
+        if r.status_code == 200:
+            d = r.json()
+            return YTInfo(
+                id=vid, title=d.get("title") or "YouTube video",
+                uploader=d.get("author_name") or "", duration=0,
+                thumbnail=d.get("thumbnail_url") or _thumb(vid),
+            )
+    except Exception as e:
+        log.info("oEmbed failed: %r", e)
+    return None
+
+
+def _check_limits(info: YTInfo) -> YTInfo:
+    if info.duration and info.duration > MAX_MIN * 60:
+        raise YTError(f"Video {MAX_MIN} minute se lamba hai.")
+    return info
+
+
+async def get_info(url: str) -> YTInfo:
+    vid = video_id(url)
+
+    # 1) the download API (no cookies, no bot check)
+    if vid and API_URL:
+        info = await _api_info(vid)
+        if info:
+            return _check_limits(info)
+
+    # 2) yt-dlp
+    try:
+        data = await asyncio.to_thread(_info_sync, url)
     except Exception as e:
         log.warning("yt-dlp info failed: %s", str(e)[:400])
+        # 3) public oEmbed, so the quality menu still appears
+        if vid:
+            info = await _oembed_info(vid)
+            if info:
+                return info
         raise YTError(_friendly(str(e)))
-    if not info:
+    if not data:
         raise YTError("Video ki info nahi mili.")
-    if info.get("is_live"):
+    if data.get("is_live"):
         raise YTError("Live stream download nahi ho sakti.")
-    dur = int(info.get("duration") or 0)
-    if dur > MAX_MIN * 60:
-        raise YTError(f"Video {MAX_MIN} minute se lamba hai.")
-    return YTInfo(
-        id=info["id"],
-        title=info.get("title") or "YouTube video",
-        uploader=info.get("uploader") or info.get("channel") or "",
-        duration=dur,
-        thumbnail=info.get("thumbnail") or "",
-    )
+    return _check_limits(YTInfo(
+        id=data["id"],
+        title=data.get("title") or "YouTube video",
+        uploader=data.get("uploader") or data.get("channel") or "",
+        duration=int(data.get("duration") or 0),
+        thumbnail=data.get("thumbnail") or "",
+    ))
 
 
 def _download_sync(vid: str, fmt: str, folder: str) -> dict:
@@ -313,7 +395,7 @@ def _download_sync(vid: str, fmt: str, folder: str) -> dict:
         return ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=True) or {}
 
 
-async def download(vid: str, fmt: str, folder: str) -> YTFile:
+async def _download_ytdlp(vid: str, fmt: str, folder: str) -> YTFile:
     if fmt not in FORMATS:
         raise YTError("Invalid format.")
     try:
@@ -341,6 +423,95 @@ async def download(vid: str, fmt: str, folder: str) -> YTFile:
         width=int(info.get("width") or 0),
         height=int(info.get("height") or 0),
     )
+
+
+async def _probe_media(path: str):
+    """(duration_sec, width, height) read with ffmpeg, so Telegram shows the video correctly."""
+    try:
+        from pinterest import _ffmpeg_exe
+        exe = _ffmpeg_exe()
+        proc = await asyncio.create_subprocess_exec(
+            exe, "-hide_banner", "-i", path,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await proc.communicate()
+    except Exception:
+        return 0, 0, 0
+    text = err.decode(errors="ignore")
+    dur = 0
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text)
+    if m:
+        dur = int(int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)))
+    w = h = 0
+    m = re.search(r"Video:.*?,\s*(\d{2,5})x(\d{2,5})", text)
+    if m:
+        w, h = int(m.group(1)), int(m.group(2))
+    return dur, w, h
+
+
+def _rm(path: str):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+async def _download_api(vid: str, fmt: str, folder: str):
+    """Fetch the finished file from the download API. None = didn't work."""
+    dl_type = "audio" if fmt == "mp3" else "video"
+    path = os.path.join(folder, f"{vid}.{'mp3' if dl_type == 'audio' else 'mp4'}")
+    params = {"query": vid, "dl_type": dl_type}
+    if API_KEY:
+        params["api_key"] = API_KEY
+    limit = BIG_MAX_MB * 1024 * 1024
+    size = 0
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=15.0),
+                                     follow_redirects=True) as c:
+            async with c.stream("GET", f"{API_URL}/download", params=params) as r:
+                ctype = r.headers.get("content-type", "").lower()
+                if r.status_code != 200 or "json" in ctype or "text/html" in ctype:
+                    body = (await r.aread())[:200]
+                    log.warning("API /download -> HTTP %s %s %r", r.status_code, ctype, body)
+                    return None
+                with open(path, "wb") as f:
+                    async for chunk in r.aiter_bytes(131072):
+                        size += len(chunk)
+                        if size > limit:
+                            raise YTError(f"Video {BIG_MAX_MB}MB se badi hai. MP3 ya chhota video try karo.")
+                        f.write(chunk)
+    except YTError:
+        _rm(path)
+        raise
+    except Exception as e:
+        log.warning("API download failed: %r", e)
+        _rm(path)
+        return None
+    if size < 10_000:
+        log.warning("API /download returned only %d bytes", size)
+        _rm(path)
+        return None
+
+    dur, w, h = await _probe_media(path)
+    meta = await _api_info(vid) or await _oembed_info(vid)
+    return YTFile(
+        path=path, kind="audio" if fmt == "mp3" else "video",
+        title=(meta.title if meta else "YouTube"),
+        uploader=(meta.uploader if meta else ""),
+        duration=dur or (meta.duration if meta else 0),
+        width=w, height=h,
+    )
+
+
+async def download(vid: str, fmt: str, folder: str) -> YTFile:
+    if fmt not in FORMATS:
+        raise YTError("Invalid format.")
+    if API_URL:
+        f = await _download_api(vid, fmt, folder)
+        if f:
+            return f
+        log.info("API did not deliver, trying yt-dlp")
+    return await _download_ytdlp(vid, fmt, folder)
 
 
 async def split_file(path: str, folder: str, duration: int = 0,
@@ -380,4 +551,3 @@ async def split_file(path: str, folder: str, duration: int = 0,
                     err.decode(errors="ignore")[:200])
         factor *= 0.7  # parts came out too big -> cut shorter pieces
     raise YTError("Badi file parts me split nahi ho payi. 360p ya MP3 try karo.")
-  
