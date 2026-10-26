@@ -112,30 +112,44 @@ def _env(name: str) -> str:
 
 
 def _cookie_dict():
-    """Instagram login cookies, all from Heroku config vars:
-    IG_COOKIES    = the whole cookie header copied from the browser (best)
-    IG_SESSIONID  = just the sessionid value (simple)"""
+    """Read cookies from IG_COOKIES; IG_SESSIONID is a fallback."""
     jar = {}
-    for part in _env("IG_COOKIES").split(";"):
-        if "=" in part:
-            k, v = part.split("=", 1)
-            if k.strip():
-                jar[k.strip()] = v.strip()
-    if _env("IG_SESSIONID"):
+    raw = _env("IG_COOKIES")
+    for part in raw.split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if key and value:
+            jar[key] = value
+
+    # Prefer the sessionid from the full cookie header if present.
+    if not jar.get("sessionid") and _env("IG_SESSIONID"):
         jar["sessionid"] = _env("IG_SESSIONID")
+
     return jar if jar.get("sessionid") else None
 
 
 def _cookie_file():
-    """cookies.txt for yt-dlp, built from the env cookies."""
+    """Create a private temporary Netscape cookie file for yt-dlp."""
     jar = _cookie_dict()
     if not jar:
         return None
-    path = os.path.join(tempfile.gettempdir(), "ig_cookies.txt")
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write("# Netscape HTTP Cookie File\n")
-        for k, v in jar.items():
-            f.write(f".instagram.com\tTRUE\t/\tTRUE\t2147483647\t{k}\t{v}\n")
+
+    fd, path = tempfile.mkstemp(prefix="ig_cookies_", suffix=".txt")
+    try:
+        os.chmod(path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\\n") as f:
+            f.write("# Netscape HTTP Cookie File\\n")
+            for key, value in jar.items():
+                # Cookie values are expected to be plain cookie values.
+                f.write(f".instagram.com\\tTRUE\\t/\\tTRUE\\t2147483647\\t{key}\\t{value}\\n")
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
     return path
 
 
@@ -503,55 +517,100 @@ async def fetch_instagram(url: str, folder: str, all_slides: bool = False) -> IG
 
 
 async def _fetch(url: str, folder: str, all_slides: bool) -> IGResult:
-    is_story = "/stories/" in url
-    cookies = _cookie_file()
+    """Try public methods first; use login cookies only when needed."""
+    is_story = "/stories/" in url.lower()
     jar = _cookie_dict()
+    cookies = None
+    err = ""
+
     if is_story and not jar:
         raise IGError(_friendly("", True, False))
 
-    if jar and _state["session_dead"]:
-        if is_story:  # stories need a login, nothing else to try
+    # Stories require authentication. Public posts/reels should not depend on it.
+    if is_story:
+        if _state["session_dead"]:
             await _fire_dead()
             raise IGSessionError(_SESSION_MSG)
-        jar = cookies = None  # dead session: public posts / reels are tried without it
+        cookies = _cookie_file()
+        try:
+            _state["dead"] = False
+            items, title, total = await _api_fetch(url, folder, jar, all_slides)
+            if _state["dead"]:
+                _state["session_dead"] = True
+                await _fire_dead()
+                raise IGSessionError(_SESSION_MSG)
 
-    err = ""
-    # 1) Instagram API (with the saved session if it still works)
+            if not items:
+                try:
+                    title = await asyncio.to_thread(_ytdlp, url, folder, cookies)
+                except Exception as exc:
+                    err = str(exc)
+                    log.warning("Instagram story yt-dlp failed: %s", err[:250])
+                found = _collect(folder)
+                total = len(found) or 1
+                items = _only_requested(found, url, all_slides)
+
+            if not items:
+                raise IGError(_friendly(err, True, bool(jar)))
+            return IGResult(items=items, title=title, url=url, total=total)
+        finally:
+            if cookies:
+                try:
+                    os.remove(cookies)
+                except OSError:
+                    pass
+
+    # Public posts/reels: first try without cookies to avoid relying on a login.
     _state["dead"] = False
-    items, title, total = await _api_fetch(url, folder, jar, all_slides)
-    if _state["dead"] and jar:
-        _state["session_dead"] = True
-        await _fire_dead()
-        if is_story:
-            raise IGSessionError(_SESSION_MSG)
-        jar = cookies = None  # drop the dead session and retry as a visitor
-        items, title, total = await _api_fetch(url, folder, None, all_slides)
+    items, title, total = await _api_fetch(url, folder, None, all_slides)
 
-    # 1b) the post page's own meta tags
-    if not items and not is_story:
-        items, title, total = await _html_fetch(url, folder, jar)
+    if not items:
+        items, title, total = await _html_fetch(url, folder, None)
 
-    # 2) yt-dlp
     if not items:
         try:
-            title = await asyncio.to_thread(_ytdlp, url, folder, cookies)
-        except Exception as e:  # yt-dlp raises DownloadError and friends
-            err = str(e)
-            log.warning("yt-dlp failed: %s", err[:300])
+            title = await asyncio.to_thread(_ytdlp, url, folder, None)
+        except Exception as exc:
+            err = str(exc)
+            log.warning("Public Instagram yt-dlp failed: %s", err[:250])
         found = _collect(folder)
         total = len(found) or 1
         items = _only_requested(found, url, all_slides)
 
-    # 3) public embed page (posts / reels only)
-    if not items and not is_story:
+    if not items:
         found = await _embed_fallback(url, folder)
         total = len(found) or 1
         items = _only_requested(found, url, all_slides)
-        if not items:
-            log.warning("embed fallback found nothing for %s", url)
+
+    # Optional authenticated fallback for public posts, only if public methods failed.
+    if not items and jar and not _state["session_dead"]:
+        cookies = _cookie_file()
+        try:
+            _state["dead"] = False
+            items, title, total = await _api_fetch(url, folder, jar, all_slides)
+            if _state["dead"]:
+                _state["session_dead"] = True
+                await _fire_dead()
+                items = []
+            if not items and not _state["session_dead"]:
+                items, title, total = await _html_fetch(url, folder, jar)
+            if not items and not _state["session_dead"]:
+                try:
+                    title = await asyncio.to_thread(_ytdlp, url, folder, cookies)
+                except Exception as exc:
+                    err = str(exc)
+                    log.warning("Authenticated Instagram yt-dlp failed: %s", err[:250])
+                found = _collect(folder)
+                total = len(found) or 1
+                items = _only_requested(found, url, all_slides)
+        finally:
+            if cookies:
+                try:
+                    os.remove(cookies)
+                except OSError:
+                    pass
+
     if not items:
-        if _state["session_dead"]:
-            raise IGSessionError(_SESSION_MSG)
-        raise IGError(_friendly(err, is_story, bool(cookies)))
+        raise IGError(_friendly(err, False, bool(jar) and not _state["session_dead"]))
 
     return IGResult(items=items, title=title, url=url, total=total)
