@@ -11,6 +11,7 @@ import os
 import re
 import tempfile
 from dataclasses import dataclass
+from urllib.parse import urljoin
 
 import httpx
 
@@ -48,6 +49,10 @@ class IGSessionError(IGError):
 _state = {"dead": False, "session_dead": False, "reason": "login"}
 # "dead": the last API call was rejected. "session_dead": we stopped using the session.
 _hooks = {"dead": None}
+_BLOCK_MSG = (
+    "Ye reel abhi download nahi ho pa rahi, Instagram ne server ko block kiya hai. "
+    "Thodi der baad dubara try karo."
+)
 _SESSION_MSG = (
     "Instagram login session expire ho gaya. Bot owner ko bata diya gaya hai, "
     "thodi der baad try karo."
@@ -112,44 +117,30 @@ def _env(name: str) -> str:
 
 
 def _cookie_dict():
-    """Read cookies from IG_COOKIES; IG_SESSIONID is a fallback."""
+    """Instagram login cookies, all from Heroku config vars:
+    IG_COOKIES    = the whole cookie header copied from the browser (best)
+    IG_SESSIONID  = just the sessionid value (simple)"""
     jar = {}
-    raw = _env("IG_COOKIES")
-    for part in raw.split(";"):
-        if "=" not in part:
-            continue
-        key, value = part.split("=", 1)
-        key, value = key.strip(), value.strip()
-        if key and value:
-            jar[key] = value
-
-    # Prefer the sessionid from the full cookie header if present.
-    if not jar.get("sessionid") and _env("IG_SESSIONID"):
+    for part in _env("IG_COOKIES").split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            if k.strip():
+                jar[k.strip()] = v.strip()
+    if _env("IG_SESSIONID"):
         jar["sessionid"] = _env("IG_SESSIONID")
-
     return jar if jar.get("sessionid") else None
 
 
 def _cookie_file():
-    """Create a private temporary Netscape cookie file for yt-dlp."""
+    """cookies.txt for yt-dlp, built from the env cookies."""
     jar = _cookie_dict()
     if not jar:
         return None
-
-    fd, path = tempfile.mkstemp(prefix="ig_cookies_", suffix=".txt")
-    try:
-        os.chmod(path, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\\n") as f:
-            f.write("# Netscape HTTP Cookie File\\n")
-            for key, value in jar.items():
-                # Cookie values are expected to be plain cookie values.
-                f.write(f".instagram.com\\tTRUE\\t/\\tTRUE\\t2147483647\\t{key}\\t{value}\\n")
-    except Exception:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-        raise
+    path = os.path.join(tempfile.gettempdir(), "ig_cookies.txt")
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("# Netscape HTTP Cookie File\n")
+        for k, v in jar.items():
+            f.write(f".instagram.com\tTRUE\t/\tTRUE\t2147483647\t{k}\t{v}\n")
     return path
 
 
@@ -182,6 +173,25 @@ def _ytdlp(url: str, folder: str, cookies) -> str:
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True) or {}
     return (info.get("title") or info.get("description") or "").strip()
+
+
+def _clean_title(raw: str, limit: int = 150) -> str:
+    """'user on Instagram: "caption..."' -> 'user: caption...' cut at a word boundary."""
+    t = html.unescape(raw or "").strip()
+    user = ""
+    m = re.match(r'^(.*?)\s+on Instagram:\s*["\u201c]?(.*)$', t, re.S)
+    if m:
+        user, t = m.group(1).strip(), m.group(2)
+    t = re.sub(r"^(Video|Photo|Reel)s? by .*$", "", t.strip())  # yt-dlp's generic titles
+    t = re.sub(r'["\u201d]\s*$', "", t.strip())                  # closing quote
+    t = re.sub(r"\s+", " ", t).strip()
+    if user and t:
+        t = f"{user}: {t}"
+    elif user:
+        t = user
+    if len(t) > limit:
+        t = t[:limit].rsplit(" ", 1)[0].rstrip(",;:-\u2013 ") + "\u2026"
+    return t
 
 
 def _img_index(url: str):
@@ -240,8 +250,11 @@ async def _embed_fallback(url: str, folder: str):
 
         urls = []
         vurl = _embed_video_url(page)
+        reel = bool(re.search(r"instagram\.com/(?:reel|reels|tv)/", url))
         if vurl:
             urls.append(("video", vurl))
+        elif reel or _looks_like_video(page):
+            log.warning("embed page only has a thumbnail of a video, not sending it")
         else:
             for src in re.findall(
                 r'<img[^>]*class="[^"]*EmbeddedMediaImage[^"]*"[^>]*src="([^"]+)"', page
@@ -315,7 +328,7 @@ async def _download_item(item: dict, folder: str, only=None, all_slides: bool = 
         for i, mm in enumerate(medias[:MAX_ITEMS]):
             if mm.get("video_versions"):
                 kind, u, ext = "video", mm["video_versions"][0]["url"], ".mp4"
-            elif (mm.get("image_versions2") or {}).get("candidates"):
+            elif (mm.get("image_versions2") or {}).get("candidates") and mm.get("media_type") != 2:
                 kind, u, ext = "photo", mm["image_versions2"]["candidates"][0]["url"], ".jpg"
             else:
                 continue
@@ -339,7 +352,7 @@ async def _download_item(item: dict, folder: str, only=None, all_slides: bool = 
                 os.remove(path)
                 continue
             out.append(IGItem(kind, path))
-    title = caption.splitlines()[0][:150] if caption else ""
+    title = _clean_title(caption.splitlines()[0]) if caption else ""
     return out, title, total
 
 
@@ -395,27 +408,44 @@ async def _api_fetch(url: str, folder: str, jar, all_slides: bool = False):
     return [], "", 1
 
 
-async def _html_fetch(url: str, folder: str, jar):
-    """Read the post page itself: og:video / og:image describe exactly this post."""
-    m = re.search(r"instagram\.com/(?:p|reel|reels|tv)/([\w-]+)", url)
+def _looks_like_video(page: str) -> bool:
+    return any(k in page for k in (
+        '"is_video":true', '\\"is_video\\":true', "GraphVideo", "XDTGraphVideo", "video_url",
+    ))
+
+
+FIXER_UA = "TelegramBot (like TwitterBot)"
+
+
+async def _html_fetch(url: str, folder: str, jar, base: str = "https://www.instagram.com",
+                      ua: str = None):
+    """Read a post page's meta tags: og:video / og:image describe exactly this post.
+    A thumbnail is never returned for a video post or reel."""
+    m = re.search(r"instagram\.com/(p|reel|reels|tv)/([\w-]+)", url)
     if not m:
         return [], "", 1
-    page_url = f"https://www.instagram.com/p/{m.group(1)}/"
+    ptype = "reel" if m.group(1) in ("reel", "reels") else m.group(1)
+    is_video_url = ptype in ("reel", "tv")
+    page_url = f"{base}/{ptype}/{m.group(2)}/"
+    agent = ua or _ig_ua()
     headers = {
-        "User-Agent": _ig_ua(), "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": agent, "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "none",
     }
+    if not ua:
+        headers.update({"Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate",
+                        "Sec-Fetch-Site": "none"})
+    host = base.split("//")[1]
     async with httpx.AsyncClient(timeout=60, cookies=jar or None, proxy=_proxy(),
                                  follow_redirects=True, max_redirects=4) as client:
         try:
             r = await client.get(page_url, headers=headers)
         except httpx.HTTPError as e:
-            log.warning("IG page error: %r", e)
+            log.warning("IG page %s error: %r", host, e)
             return [], "", 1
     page = r.text
     if r.status_code != 200:
-        log.warning("IG page -> HTTP %s final=%s", r.status_code, str(r.url)[:120])
+        log.warning("IG page %s -> HTTP %s final=%s", host, r.status_code, str(r.url)[:120])
         return [], "", 1
 
     def meta(prop):
@@ -424,18 +454,27 @@ async def _html_fetch(url: str, folder: str, jar):
 
     video = meta("og:video") or meta("og:video:secure_url")
     image = meta("og:image")
-    kind, media_url = ("video", video) if video else (("photo", image) if image else (None, None))
-    if not media_url:
-        log.warning("IG page has no og:video/og:image (final=%s, %d bytes)", str(r.url)[:100], len(page))
+    if video:
+        kind, media_url = "video", urljoin(page_url, video)
+    elif image and not (is_video_url or "video" in (meta("og:type") or "").lower()
+                        or _looks_like_video(page)):
+        kind, media_url = "photo", urljoin(page_url, image)
+    else:
+        what = "only a thumbnail of a video" if image else "no og:video/og:image"
+        log.warning("IG page %s has %s (%d bytes)", host, what, len(page))
         return [], "", 1
-    title = (meta("og:title") or "")[:150]
+
+    title = _clean_title(meta("og:title") or "")
     path = os.path.join(folder, "page_00" + (".mp4" if kind == "video" else ".jpg"))
     limit = MAX_FILE_MB * 1024 * 1024
     size = 0
-    async with httpx.AsyncClient(timeout=120, headers={"User-Agent": UA}) as c:
+    async with httpx.AsyncClient(timeout=120, headers={"User-Agent": agent},
+                                 follow_redirects=True) as c:
         try:
             async with c.stream("GET", media_url) as resp:
-                if resp.status_code != 200:
+                ctype = resp.headers.get("content-type", "").lower()
+                if resp.status_code != 200 or "text/html" in ctype:
+                    log.warning("IG page %s media -> HTTP %s %s", host, resp.status_code, ctype)
                     return [], "", 1
                 with open(path, "wb") as f:
                     async for chunk in resp.aiter_bytes(256 * 1024):
@@ -444,10 +483,31 @@ async def _html_fetch(url: str, folder: str, jar):
                             return [], "", 1
                         f.write(chunk)
         except httpx.HTTPError as e:
-            log.warning("IG page media download failed: %r", e)
+            log.warning("IG page %s media download failed: %r", host, e)
             return [], "", 1
-    log.info("IG page -> %s via og tags", kind)
+    if size < 5_000:
+        _rm_quiet(path)
+        return [], "", 1
+    log.info("IG page %s -> %s via og tags", host, kind)
     return [IGItem(kind, path)], title, 1
+
+
+def _rm_quiet(path: str):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+async def _fixer_fetch(url: str, folder: str):
+    """Public re-embed services (made for Telegram/Discord previews). Optional, may be offline:
+    IG_FIX_DOMAINS=kkinstagram.com,ddinstagram.com  (set empty to switch off)."""
+    domains = [d.strip() for d in os.getenv("IG_FIX_DOMAINS", "kkinstagram.com,ddinstagram.com").split(",") if d.strip()]
+    for d in domains:
+        items, title, total = await _html_fetch(url, folder, None, base=f"https://{d}", ua=FIXER_UA)
+        if items:
+            return items, title, total
+    return [], "", 1
 
 
 def _friendly(err: str, is_story: bool, has_cookies: bool) -> str:
@@ -517,100 +577,62 @@ async def fetch_instagram(url: str, folder: str, all_slides: bool = False) -> IG
 
 
 async def _fetch(url: str, folder: str, all_slides: bool) -> IGResult:
-    """Try public methods first; use login cookies only when needed."""
-    is_story = "/stories/" in url.lower()
+    is_story = "/stories/" in url
+    cookies = _cookie_file()
     jar = _cookie_dict()
-    cookies = None
-    err = ""
-
     if is_story and not jar:
         raise IGError(_friendly("", True, False))
 
-    # Stories require authentication. Public posts/reels should not depend on it.
-    if is_story:
-        if _state["session_dead"]:
+    if jar and _state["session_dead"]:
+        if is_story:  # stories need a login, nothing else to try
             await _fire_dead()
             raise IGSessionError(_SESSION_MSG)
-        cookies = _cookie_file()
-        try:
-            _state["dead"] = False
-            items, title, total = await _api_fetch(url, folder, jar, all_slides)
-            if _state["dead"]:
-                _state["session_dead"] = True
-                await _fire_dead()
-                raise IGSessionError(_SESSION_MSG)
+        jar = cookies = None  # dead session: public posts / reels are tried without it
 
-            if not items:
-                try:
-                    title = await asyncio.to_thread(_ytdlp, url, folder, cookies)
-                except Exception as exc:
-                    err = str(exc)
-                    log.warning("Instagram story yt-dlp failed: %s", err[:250])
-                found = _collect(folder)
-                total = len(found) or 1
-                items = _only_requested(found, url, all_slides)
-
-            if not items:
-                raise IGError(_friendly(err, True, bool(jar)))
-            return IGResult(items=items, title=title, url=url, total=total)
-        finally:
-            if cookies:
-                try:
-                    os.remove(cookies)
-                except OSError:
-                    pass
-
-    # Public posts/reels: first try without cookies to avoid relying on a login.
+    err = ""
+    # 1) Instagram API (with the saved session if it still works)
     _state["dead"] = False
-    items, title, total = await _api_fetch(url, folder, None, all_slides)
+    items, title, total = await _api_fetch(url, folder, jar, all_slides)
+    if _state["dead"] and jar:
+        _state["session_dead"] = True
+        await _fire_dead()
+        if is_story:
+            raise IGSessionError(_SESSION_MSG)
+        jar = cookies = None  # drop the dead session and retry as a visitor
+        items, title, total = await _api_fetch(url, folder, None, all_slides)
 
-    if not items:
-        items, title, total = await _html_fetch(url, folder, None)
+    # 1b) the post page's own meta tags
+    if not items and not is_story:
+        items, title, total = await _html_fetch(url, folder, jar)
 
+    # 2) yt-dlp
     if not items:
         try:
-            title = await asyncio.to_thread(_ytdlp, url, folder, None)
-        except Exception as exc:
-            err = str(exc)
-            log.warning("Public Instagram yt-dlp failed: %s", err[:250])
+            title = _clean_title(await asyncio.to_thread(_ytdlp, url, folder, cookies))
+        except Exception as e:  # yt-dlp raises DownloadError and friends
+            err = str(e)
+            log.warning("yt-dlp failed: %s", err[:300])
         found = _collect(folder)
         total = len(found) or 1
         items = _only_requested(found, url, all_slides)
 
-    if not items:
+    # 3) re-embed services (public posts / reels only)
+    if not items and not is_story:
+        items, t2, total = await _fixer_fetch(url, folder)
+        title = t2 or title
+
+    # 4) public embed page (posts / reels only)
+    if not items and not is_story:
         found = await _embed_fallback(url, folder)
         total = len(found) or 1
         items = _only_requested(found, url, all_slides)
-
-    # Optional authenticated fallback for public posts, only if public methods failed.
-    if not items and jar and not _state["session_dead"]:
-        cookies = _cookie_file()
-        try:
-            _state["dead"] = False
-            items, title, total = await _api_fetch(url, folder, jar, all_slides)
-            if _state["dead"]:
-                _state["session_dead"] = True
-                await _fire_dead()
-                items = []
-            if not items and not _state["session_dead"]:
-                items, title, total = await _html_fetch(url, folder, jar)
-            if not items and not _state["session_dead"]:
-                try:
-                    title = await asyncio.to_thread(_ytdlp, url, folder, cookies)
-                except Exception as exc:
-                    err = str(exc)
-                    log.warning("Authenticated Instagram yt-dlp failed: %s", err[:250])
-                found = _collect(folder)
-                total = len(found) or 1
-                items = _only_requested(found, url, all_slides)
-        finally:
-            if cookies:
-                try:
-                    os.remove(cookies)
-                except OSError:
-                    pass
-
+        if not items:
+            log.warning("embed fallback found nothing for %s", url)
     if not items:
-        raise IGError(_friendly(err, False, bool(jar) and not _state["session_dead"]))
+        if _state["session_dead"] and is_story:
+            raise IGSessionError(_SESSION_MSG)
+        if _state["session_dead"]:
+            raise IGError(_BLOCK_MSG)
+        raise IGError(_friendly(err, is_story, bool(cookies)))
 
     return IGResult(items=items, title=title, url=url, total=total)
