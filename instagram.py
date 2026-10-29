@@ -1,394 +1,424 @@
+"""YouTube downloader: video and MP3.
+
+Download order: 1) your download API (API_URL + API_KEY, no cookies needed)
+                2) yt-dlp fallback (cookies optional, via /ytcookies)
+
+Flow: user sends a link -> bot shows title + thumbnail with quality buttons ->
+user taps a button -> bot downloads and sends the file.
+
+Optional env:
+  YT_COOKIES_B64  base64 of a cookies.txt (YouTube blocks most server IPs without it)
+  YT_PROXY        proxy URL, e.g. http://user:pass@host:port
+  YT_MAX_MIN      max video length in minutes (default 60)
 """
-Instagram downloader for the Telegram bot.
-
-Flow:
-  - Public reel / post / tv  -> yt-dlp first (free), API fallback if it fails
-  - Stories / highlights     -> directly API (yt-dlp needs login for these)
-
-API: RiteshYT (API_URL + API_KEY environment variables)
-No Instagram login session or cookies required.
-"""
-
-from __future__ import annotations
-
 import asyncio
+import base64
+import html
+import json
 import logging
+import math
 import os
 import re
+import shutil
+import tempfile
 from dataclasses import dataclass
-from pathlib import Path
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 import httpx
 
-log = logging.getLogger("pinbot.instagram")
+from config import API_HASH, API_ID, MAX_FILE_MB, MONGO_DB, MONGO_URI, eid, em
+from tg import btn
 
-# Set these as environment variables. Do not hard-code your API key.
-API_URL = os.getenv("API_URL", "https://api.riteshyt.in").rstrip("/")
-API_KEY = os.getenv("API_KEY", "riteshfreee0aac51ec0bc9720157ffc57").strip()
+log = logging.getLogger("pinbot")
 
-IG_RE = re.compile(
-    r"https?://(?:www\.|m\.)?instagram\.com/"
-    r"(?:[\w.]+/)?"
-    r"(?:reel|reels|p|tv|stories|s|share)/[^\s<>\]\[\"']+",
-    re.IGNORECASE,
+YT_RE = re.compile(
+    r"https?://(?:www\.|m\.|music\.)?"
+    r"(?:youtube\.com/(?:watch\?[^\s]*?v=|shorts/|live/)|youtu\.be/)[\w-]{11}[^\s]*",
+    re.I,
 )
+ID_RE = re.compile(r"(?:v=|youtu\.be/|shorts/|live/)([\w-]{11})")
+MAX_MIN = int(os.getenv("YT_MAX_MIN", "60"))
+# Files above 50MB are downloaded (up to this size) and sent in parts
+# Download API. Heroku Config Vars:
+#   API_URL=https://your-api-host      API_KEY=your-key
+API_URL = os.getenv("API_URL", "https://api.riteshyt.in").strip().rstrip("/")
+API_KEY = os.getenv("API_KEY", "riteshfreee0aac51ec0bc9720157ffc57").strip()  # key kabhi code me hard-code mat karo
+BIG_MAX_MB = int(os.getenv("YT_BIG_MAX_MB", "1000" if (API_ID and API_HASH) else "300"))
 
-# Stories / highlights / share-links of highlights -> API only
-API_ONLY_RE = re.compile(r"instagram\.com/(?:stories/|s/)", re.IGNORECASE)
+FORMATS = {"v360": 360, "v720": 720, "mp3": 0}
 
 
-class IGError(Exception):
-    """Instagram download or API error."""
-
-
-class IGSessionError(IGError):
-    """Legacy compatibility only; this module does not use Instagram sessions."""
-
-
-@dataclass
-class IGItem:
-    path: str
-    kind: str  # "video" or "photo"
+class YTError(Exception):
+    pass
 
 
 @dataclass
-class IGResult:
-    url: str
+class YTInfo:
+    id: str
     title: str
-    total: int
-    items: list[IGItem]
+    uploader: str
+    duration: int
+    thumbnail: str
 
 
-def set_dead_hook(_hook):
-    """Legacy compatibility: no session-expiry hook is used."""
-    return None
+@dataclass
+class YTFile:
+    path: str
+    kind: str  # video | audio
+    title: str
+    uploader: str
+    duration: int
+    width: int
+    height: int
 
 
-async def watchdog_once():
-    """Legacy compatibility: session watchdog removed; intentionally does nothing."""
-    return None
+def video_id(url: str):
+    m = ID_RE.search(url)
+    return m.group(1) if m else None
 
 
-def _clean_url(url: str) -> str:
-    url = (url or "").strip().rstrip(".,!?);]")
-    if not IG_RE.search(url):
-        raise IGError("Valid Instagram Reel/Post/Story link bhejo.")
-    return url
+# ---------- UI helpers ----------
+def _fmt_duration(sec: int) -> str:
+    h, rem = divmod(int(sec), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-# ---------------------------------------------------------------------------
-# yt-dlp (primary for public reels / posts)
-# ---------------------------------------------------------------------------
-def _yt_dlp_worker(link: str, folder: str, all_slides: bool) -> IGResult:
-    """Synchronous yt-dlp worker, run in a thread so the bot event loop stays responsive."""
-    try:
-        import yt_dlp
-    except ImportError as exc:
-        raise IGError("yt-dlp install nahi hai (pip install -U yt-dlp).") from exc
-
-    opts = {
-        "outtmpl": os.path.join(folder, "%(id)s_%(autonumber)03d.%(ext)s"),
-        "format": "best[ext=mp4]/best",
-        "noplaylist": not all_slides,
-        "quiet": True,
-        "no_warnings": True,
-        "ignoreerrors": False,
-        "retries": 2,
-        "fragment_retries": 2,
-        "socket_timeout": 25,
-        "restrictfilenames": True,
-    }
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(link, download=True)
-            if not info:
-                raise IGError("yt-dlp ko media nahi mili.")
-            entries = info.get("entries")
-            leaf_infos = [x for x in entries if x] if isinstance(entries, list) else [info]
-            if not all_slides and leaf_infos:
-                leaf_infos = leaf_infos[:1]
-
-            files = []
-            seen = set()
-            for entry in leaf_infos:
-                candidates = []
-                for req in entry.get("requested_downloads") or []:
-                    if req.get("filepath"):
-                        candidates.append(req["filepath"])
-                if entry.get("_filename"):
-                    candidates.append(entry["_filename"])
-                try:
-                    candidates.append(ydl.prepare_filename(entry))
-                except Exception:
-                    pass
-                for candidate in candidates:
-                    candidate = os.path.abspath(candidate)
-                    if candidate not in seen and os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
-                        seen.add(candidate)
-                        files.append((candidate, entry))
-                        break
-
-            if not files:
-                for p in sorted(Path(folder).iterdir()):
-                    if p.is_file() and p.stat().st_size > 0 and p.suffix.lower() not in (".json", ".part"):
-                        files.append((str(p), info))
-
-            if not files:
-                raise IGError("yt-dlp ne download kiya, lekin file locate nahi hui.")
-
-            result = []
-            for path, _entry in files:
-                ext = Path(path).suffix.lower()
-                kind = "photo" if ext in (".jpg", ".jpeg", ".png", ".webp") else "video"
-                result.append(IGItem(path=path, kind=kind))
-            title = str(info.get("title") or info.get("description") or "Instagram media")
-            total = int(info.get("playlist_count") or info.get("n_entries") or len(result) or 1)
-            return IGResult(url=link, title=title, total=max(total, len(result)), items=result)
-    except IGError:
-        raise
-    except Exception as exc:
-        message = str(exc).replace("\n", " ")[:350]
-        raise IGError(f"yt-dlp fail: {message}") from exc
+def menu_text(info: YTInfo) -> str:
+    return (
+        f"{em('pin', '📌')} <b>{html.escape(info.title[:200])}</b>\n"
+        f"{em('link', '🔗')} {html.escape(info.uploader[:60])}  •  {_fmt_duration(info.duration)}\n\n"
+        f"Quality choose karo:"
+    )
 
 
-# ---------------------------------------------------------------------------
-# RiteshYT API (fallback + stories / highlights)
-# ---------------------------------------------------------------------------
-def _walk_dicts(obj):
-    """Yield dictionaries nested in a JSON response, without assuming one schema."""
-    if isinstance(obj, dict):
-        yield obj
-        for value in obj.values():
-            if isinstance(value, (dict, list)):
-                yield from _walk_dicts(value)
-    elif isinstance(obj, list):
-        for value in obj:
-            if isinstance(value, (dict, list)):
-                yield from _walk_dicts(value)
-
-
-def _first_value(objects, keys):
-    for obj in objects:
-        for key in keys:
-            value = obj.get(key)
-            if value not in (None, "", [], {}):
-                return value
-    return None
-
-
-def _normalize_media_url(value):
-    if not isinstance(value, str):
-        return None
-    value = value.strip()
-    if value.startswith("//"):
-        return "https:" + value
-    if value.startswith("/"):
-        return urljoin(API_URL + "/", value.lstrip("/"))
-    if value.startswith(("https://", "http://")):
-        return value
-    return None
-
-
-def _media_urls(payload):
-    """Extract common media URL shapes from API responses (carousel, stories, single media)."""
-    found = []
-    seen = set()
-    objects = list(_walk_dicts(payload))
-
-    for obj in objects:
-        for key in ("items", "media", "carousel_media", "media_urls", "resources", "results", "stories"):
-            value = obj.get(key)
-            if isinstance(value, list):
-                for entry in value:
-                    if isinstance(entry, str):
-                        candidate = _normalize_media_url(entry)
-                        if candidate:
-                            found.append((candidate, ""))
-                    elif isinstance(entry, dict):
-                        nested = list(_walk_dicts(entry))
-                        candidate = _first_value(nested, (
-                            "download_url", "video_url", "videoUrl", "image_url",
-                            "imageUrl", "display_url", "displayUrl", "media_url",
-                            "mediaUrl", "src", "url", "thumbnail_url",
-                        ))
-                        candidate = _normalize_media_url(candidate)
-                        kind = str(_first_value(nested, ("type", "media_type", "kind")) or "").lower()
-                        if candidate:
-                            found.append((candidate, kind))
-
-    for obj in objects:
-        for key in (
-            "download_url", "video_url", "videoUrl", "image_url", "imageUrl",
-            "display_url", "displayUrl", "media_url", "mediaUrl", "direct_url",
-        ):
-            candidate = _normalize_media_url(obj.get(key))
-            if candidate:
-                kind = str(obj.get("type") or obj.get("media_type") or obj.get("kind") or "").lower()
-                found.append((candidate, kind))
-
-    for obj in objects:
-        candidate = _normalize_media_url(obj.get("url"))
-        if candidate:
-            parsed = urlparse(candidate)
-            if any(x in parsed.path.lower() for x in (".mp4", ".jpg", ".jpeg", ".png", ".webp", ".m4v", "/stream")):
-                kind = str(obj.get("type") or obj.get("media_type") or obj.get("kind") or "").lower()
-                found.append((candidate, kind))
-
-    for candidate, kind in found:
-        if candidate not in seen:
-            seen.add(candidate)
-            yield candidate, kind
-
-
-def _add_api_key_to_stream(url: str) -> str:
-    """Some API stream routes also require the same API key."""
-    parsed = urlparse(url)
-    api_host = urlparse(API_URL).netloc
-    if parsed.netloc and parsed.netloc != api_host:
-        return url
-    query = parse_qs(parsed.query, keep_blank_values=True)
-    if API_KEY and not query.get("api_key"):
-        query["api_key"] = [API_KEY]
-        parsed = parsed._replace(query=urlencode(query, doseq=True))
-    return urlunparse(parsed)
-
-
-def _suffix_from_url(url: str, content_type: str = "") -> str:
-    path = urlparse(url).path.lower()
-    for ext in (".mp4", ".m4v", ".mov", ".webm", ".jpg", ".jpeg", ".png", ".webp", ".gif"):
-        if path.endswith(ext):
-            return ext
-    ctype = (content_type or "").split(";", 1)[0].lower()
+def menu_kb(vid: str) -> dict:
     return {
-        "video/mp4": ".mp4",
-        "video/quicktime": ".mov",
-        "video/webm": ".webm",
-        "image/jpeg": ".jpg",
-        "image/png": ".png",
-        "image/webp": ".webp",
-        "image/gif": ".gif",
-    }.get(ctype, ".mp4")
+        "inline_keyboard": [
+            [
+                btn("360p", cb=f"yt:v360:{vid}", style="primary", emoji_id=eid("fire")),
+                btn("720p HD", cb=f"yt:v720:{vid}", style="primary", emoji_id=eid("fire")),
+            ],
+            [btn("MP3 Audio", cb=f"yt:mp3:{vid}", style="success", emoji_id=eid("ok"))],
+            [btn("Cancel", cb=f"yt:x:{vid}", style="danger", emoji_id=eid("delete"))],
+        ]
+    }
 
 
-async def _download_url(client: httpx.AsyncClient, url: str, folder: str, index: int) -> IGItem:
-    url = _add_api_key_to_stream(url)
+# ---------- yt-dlp plumbing ----------
+ENV_COOKIE_PATH = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+OWNER_COOKIE_PATH = os.path.join(tempfile.gettempdir(), "yt_cookies_owner.txt")
+
+
+def _to_text(data: bytes):
+    for enc in ("utf-8-sig", "utf-16"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def normalize_cookies(text: str, domains=("youtube.com", "google.com")):
+    """Repair a cookies.txt into strict Netscape format. Returns (text, count) or (None, 0).
+    Fixes: spaces instead of tabs, CRLF, extra comment lines, missing header."""
+    lines = ["# Netscape HTTP Cookie File"]
+    n = 0
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        s = line.strip()
+        if not s or (s.startswith("#") and not s.startswith("#HttpOnly_")):
+            continue
+        parts = line.strip("\n").split("\t")
+        if len(parts) != 7:
+            parts = s.split(None, 6)
+        if (
+            len(parts) != 7
+            or parts[1].strip().upper() not in ("TRUE", "FALSE")
+            or parts[3].strip().upper() not in ("TRUE", "FALSE")
+            or not parts[4].strip().isdigit()
+        ):
+            continue
+        lines.append("\t".join(p.strip() for p in parts))
+        n += 1
+    if n and any(d in l for l in lines for d in domains):
+        return "\n".join(lines) + "\n", n
+    return None, 0
+
+
+def _cookie_file():
+    """Cookies saved via /ytcookies win; otherwise YT_COOKIES_B64 (base64 or plain)."""
+    if os.path.exists(OWNER_COOKIE_PATH):
+        return OWNER_COOKIE_PATH
+    raw = os.getenv("YT_COOKIES_B64", "").strip()
+    if not raw:
+        return None
     try:
-        async with client.stream("GET", url, follow_redirects=True, timeout=90) as response:
-            response.raise_for_status()
-            ctype = response.headers.get("content-type", "")
-            if "application/json" in ctype.lower() or "text/html" in ctype.lower():
-                body = (await response.aread())[:500].decode("utf-8", "replace")
-                raise IGError(f"API media endpoint ne file ke bajaye response diya: {body[:250]}")
-            suffix = _suffix_from_url(url, ctype)
-            path = os.path.join(folder, f"instagram_{index}{suffix}")
-            with open(path, "wb") as out:
-                async for chunk in response.aiter_bytes():
-                    out.write(chunk)
-        if not os.path.exists(path) or os.path.getsize(path) < 128:
-            raise IGError("Empty ya invalid media file mili.")
-        kind = "photo" if suffix in (".jpg", ".jpeg", ".png", ".webp") else "video"
-        return IGItem(path=path, kind=kind)
-    except httpx.HTTPStatusError as exc:
-        raise IGError(f"Media download HTTP {exc.response.status_code}; API stream URL/access check karo.") from exc
-    except httpx.HTTPError as exc:
-        raise IGError(f"Media download network error: {exc}") from exc
+        data = base64.b64decode(re.sub(r"\s+", "", raw), validate=True)
+    except Exception:
+        data = raw.replace("\\n", "\n").replace("\\t", "\t").encode()
+    text = _to_text(data)
+    clean, _ = normalize_cookies(text) if text else (None, 0)
+    if not clean:
+        log.warning("YT_COOKIES_B64 galat hai, ignore kar raha hu. Bot ko /ytcookies se cookies.txt bhejo.")
+        return None
+    with open(ENV_COOKIE_PATH, "w", encoding="utf-8", newline="\n") as f:
+        f.write(clean)
+    return ENV_COOKIE_PATH
 
 
-async def _api_download(link: str, folder: str, all_slides: bool) -> IGResult:
-    if not API_KEY:
-        raise IGError("API_KEY environment variable set nahi hai.")
-    endpoint = f"{API_URL}/api/platform/extract"
-    timeout = httpx.Timeout(45.0, connect=15.0)
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; MediaDownloader/1.0)"}
+_settings_col = None
 
-    async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
+
+async def _settings():
+    global _settings_col
+    if not MONGO_URI:
+        return None
+    if _settings_col is None:
+        from pymongo import AsyncMongoClient
+        _settings_col = AsyncMongoClient(MONGO_URI)[MONGO_DB]["settings"]
+    return _settings_col
+
+
+def _write_owner_cookies(clean: str):
+    with open(OWNER_COOKIE_PATH, "w", encoding="utf-8", newline="\n") as f:
+        f.write(clean)
+
+
+async def save_cookies(raw: bytes) -> int:
+    """Owner uploads a cookies.txt through the bot (/ytcookies)."""
+    text = _to_text(raw)
+    clean, n = normalize_cookies(text) if text else (None, 0)
+    if not clean:
+        raise YTError("Ye valid cookies.txt nahi lag rahi. youtube.com ki Netscape format cookies chahiye.")
+    _write_owner_cookies(clean)
+    col = await _settings()
+    if col is not None:
+        await col.update_one({"_id": "yt_cookies"}, {"$set": {"data": clean}}, upsert=True)
+    return n
+
+
+async def load_cookies():
+    """On startup: restore cookies saved earlier with /ytcookies."""
+    col = await _settings()
+    if col is None:
+        return
+    doc = await col.find_one({"_id": "yt_cookies"})
+    if doc and doc.get("data"):
+        _write_owner_cookies(doc["data"])
+        log.info("YouTube cookies restored from database")
+
+
+def _ffmpeg_dir():
+    """yt-dlp wants a dir containing `ffmpeg`; reuse the pip-bundled binary."""
+    if shutil.which("ffmpeg"):
+        return None
+    try:
+        from pinterest import _ffmpeg_exe
+        exe = _ffmpeg_exe()
+    except Exception:
+        return None
+    d = os.path.join(tempfile.gettempdir(), "ytbin")
+    os.makedirs(d, exist_ok=True)
+    link = os.path.join(d, "ffmpeg")
+    if not os.path.exists(link):
         try:
-            response = await client.get(endpoint, params={"url": link, "api_key": API_KEY})
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            code = exc.response.status_code
-            if code in (401, 403):
-                raise IGError("Instagram API ne key/access reject kiya (HTTP 401/403).") from exc
-            if code == 429:
-                raise IGError("Instagram API rate limit (HTTP 429); thodi der baad try karo.") from exc
-            raise IGError(f"Instagram API HTTP {code}.") from exc
-        except httpx.HTTPError as exc:
-            raise IGError(f"Instagram API connect nahi hua: {exc}") from exc
-
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise IGError("Instagram API ne valid JSON response nahi diya.") from exc
-
-        objects = list(_walk_dicts(payload))
-        success = _first_value(objects, ("success", "ok"))
-        if success is False:
-            message = _first_value(objects, ("message", "detail", "error", "reason"))
-            raise IGError(f"Instagram API: {str(message or 'request failed')[:300]}")
-
-        title = str(_first_value(objects, ("title", "caption", "description", "shortcode")) or "Instagram media")
-        canonical = str(_first_value(objects, ("permalink", "canonical_url", "post_url")) or link)
-        total_value = _first_value(objects, ("total", "media_count", "carousel_count", "count"))
-        try:
-            total = max(1, int(total_value))
-        except (TypeError, ValueError):
-            total = 1
-
-        media = list(_media_urls(payload))
-        if not media:
-            message = _first_value(objects, ("message", "detail", "error", "reason"))
-            raise IGError(f"API response mein media URL nahi mila. {str(message or '')[:200]}")
-
-        if not all_slides and total > 1:
-            media = media[:1]
-
-        items = []
-        for i, (url, kind_hint) in enumerate(media, 1):
-            item = await _download_url(client, url, folder, i)
-            if kind_hint in ("image", "photo", "picture"):
-                item.kind = "photo"
-            elif kind_hint in ("video", "reel", "animation"):
-                item.kind = "video"
-            items.append(item)
-
-        if not items:
-            raise IGError("Instagram API se koi media download nahi hui.")
-        return IGResult(url=canonical, title=title, total=max(total, len(items)), items=items)
-
-
-# ---------------------------------------------------------------------------
-# Public entry point (same signature the bot already uses)
-# ---------------------------------------------------------------------------
-def _reset_folder(folder: str):
-    """Remove partial files left by a failed attempt so the next one starts clean."""
-    for p in Path(folder).iterdir():
-        try:
-            if p.is_file():
-                p.unlink()
+            os.symlink(exe, link)
         except OSError:
-            pass
+            return None
+    return d
 
 
-async def fetch_instagram(url: str, folder: str, all_slides: bool = False) -> IGResult:
-    link = _clean_url(url)
-    os.makedirs(folder, exist_ok=True)
+def _base_opts() -> dict:
+    opts = {
+        "quiet": True, "no_warnings": True, "noprogress": True,
+        "noplaylist": True, "socket_timeout": 30, "retries": 3,
+    }
+    cookies = _cookie_file()
+    if cookies:
+        opts["cookiefile"] = cookies
+    proxy = os.getenv("YT_PROXY", "").strip()
+    if proxy:
+        opts["proxy"] = proxy
+    ff = _ffmpeg_dir()
+    if ff:
+        opts["ffmpeg_location"] = ff
+    return opts
 
-    # Stories / highlights: yt-dlp can't do these without login -> API only
-    if API_ONLY_RE.search(link):
-        return await _api_download(link, folder, all_slides)
 
-    # Public reel / post: yt-dlp first, API as fallback
+def format_selector(fmt: str) -> str:
+    if fmt == "mp3":
+        return "bestaudio[ext=m4a]/bestaudio/best"
+    h = FORMATS[fmt]
+    return (
+        f"bv*[height<={h}][vcodec^=avc1]+ba[ext=m4a]"
+        f"/b[height<={h}][ext=mp4]"
+        f"/bv*[height<={h}]+ba"
+        f"/b[height<={h}]/b"
+    )
+
+
+def _friendly(err: str) -> str:
+    low = err.lower()
+    if "codec can't decode" in low or "cookie" in low:
+        return "Cookies file kharab hai. Owner bot ko /ytcookies ke saath cookies.txt file bheje."
+    if "not a bot" in low or "sign in to confirm" in low:
+        return "YouTube ne bot detect kar liya. Bot owner ko /ytcookies se cookies.txt bhejni padegi."
+    if "javascript runtime" in low or "challenge" in low or "ejs" in low:
+        return "Server pe JS runtime (deno) nahi mila, owner ko requirements me `deno` aur `yt-dlp[default]` daalna hoga."
+    if "private" in low or "unavailable" in low or "removed" in low or "terminated" in low:
+        return "Ye video private ya unavailable hai."
+    if "age" in low and "restrict" in low:
+        return "Ye video age-restricted hai, cookies ke bina download nahi hoga."
+    if "region" in low or "not available in your country" in low:
+        return "Ye video is region me available nahi hai."
+    return "YouTube se video nahi mil paya, thodi der baad try karo."
+
+
+def _info_sync(url: str) -> dict:
+    import yt_dlp
+
+    opts = _base_opts()
+    opts["skip_download"] = True
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def _thumb(vid: str) -> str:
+    return f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+
+
+async def _api_details(vid: str):
+    if not API_URL:
+        return None
+    params = {"link": f"https://www.youtube.com/watch?v={vid}"}
+    if API_KEY:
+        params["api_key"] = API_KEY
     try:
-        return await asyncio.to_thread(_yt_dlp_worker, link, folder, all_slides)
-    except Exception as exc:
-        ytdlp_error = exc
-        log.warning("yt-dlp failed, trying API (%s)", exc)
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
+            r = await c.get(f"{API_URL}/details", params=params)
+        if r.status_code == 200:
+            d = r.json()
+            if d and d.get("title"):
+                return d
+        log.warning("API /details -> HTTP %s", r.status_code)
+    except Exception as e:
+        log.warning("API /details failed: %r", e)
+    return None
 
-    _reset_folder(folder)
+
+async def _api_info(vid: str):
+    d = await _api_details(vid)
+    if not d:
+        return None
+    return YTInfo(
+        id=d.get("vidid") or vid,
+        title=d.get("title") or "YouTube video",
+        uploader="",
+        duration=int(d.get("duration_sec") or 0),
+        thumbnail=d.get("thumbnail") or _thumb(vid),
+    )
+
+
+async def _oembed_info(vid: str):
+    """Public oEmbed: title/channel/thumbnail without any login (duration unknown)."""
     try:
-        return await _api_download(link, folder, all_slides)
-    except Exception as api_error:
-        raise IGError(
-            f"yt-dlp: {str(ytdlp_error)[:150]} | API: {str(api_error)[:200]}"
-        ) from api_error
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(
+                "https://www.youtube.com/oembed",
+                params={"url": f"https://www.youtube.com/watch?v={vid}", "format": "json"},
+            )
+        if r.status_code == 200:
+            d = r.json()
+            return YTInfo(
+                id=vid, title=d.get("title") or "YouTube video",
+                uploader=d.get("author_name") or "", duration=0,
+                thumbnail=d.get("thumbnail_url") or _thumb(vid),
+            )
+    except Exception as e:
+        log.info("oEmbed failed: %r", e)
+    return None
+
+
+def _check_limits(info: YTInfo) -> YTInfo:
+    if info.duration and info.duration > MAX_MIN * 60:
+        raise YTError(f"Video {MAX_MIN} minute se lamba hai.")
+    return info
+
+
+async def get_info(url: str) -> YTInfo:
+    vid = video_id(url)
+
+    # 1) the download API (no cookies, no bot check)
+    if vid and API_URL:
+        info = await _api_info(vid)
+        if info:
+            return _check_limits(info)
+
+    # 2) yt-dlp
+    try:
+        data = await asyncio.to_thread(_info_sync, url)
+    except Exception as e:
+        log.warning("yt-dlp info failed: %s", str(e)[:400])
+        # 3) public oEmbed, so the quality menu still appears
+        if vid:
+            info = await _oembed_info(vid)
+            if info:
+                return info
+        raise YTError(_friendly(str(e)))
+    if not data:
+        raise YTError("Video ki info nahi mili.")
+    if data.get("is_live"):
+        raise YTError("Live stream download nahi ho sakti.")
+    return _check_limits(YTInfo(
+        id=data["id"],
+        title=data.get("title") or "YouTube video",
+        uploader=data.get("uploader") or data.get("channel") or "",
+        duration=int(data.get("duration") or 0),
+        thumbnail=data.get("thumbnail") or "",
+    ))
+
+
+def _download_sync(vid: str, fmt: str, folder: str) -> dict:
+    import yt_dlp
+
+    opts = _base_opts()
+    opts.update({
+        "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
+        "max_filesize": BIG_MAX_MB * 1024 * 1024,
+        "format": format_selector(fmt),
+    })
+    if fmt == "mp3":
+        opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192",
+        }]
+    else:
+        opts["merge_output_format"] = "mp4"
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=True) or {}
+
+
+async def _download_ytdlp(vid: str, fmt: str, folder: str) -> YTFile:
+    if fmt not in FORMATS:
+        raise YTError("Invalid format.")
+    try:
+        info = await asyncio.to_thread(_download_sync, vid, fmt, folder)
+    except Exception as e:
+        log.warning("yt-dlp download failed: %s", str(e)[:400])
+        raise YTError(_friendly(str(e)))
+
+    files = [
+        os.path.join(folder, n) for n in os.listdir(folder)
+        if os.path.splitext(n)[1].lower() in (".mp4", ".mkv", ".webm", ".mp3", ".m4a")
+    ]
+    if not files:
+        raise YTError(f"Video {BIG_MAX_MB}MB se badi hai ya download nahi hui. 360p ya MP3 try karo.")
+    path = max(files, key=os.path.getsize)
+    if os.path.getsize(path) > BIG_MAX_MB * 1024 * 1024:
+        raise YTError(f"Video {BIG_MAX_MB}MB se badi hai. 360p ya MP3 try karo.")
+
+    return YTFile(
+        path=path,
+        kind="audio" if fmt == "mp3" else "video",
+        title=info.get("title") or "YouTube",
+        uploader=info.get("uploader") or info.get("channel") or "",
+        duration=int(info.get("duration") or 0),
+        width=int(info.get("width") or 0),
