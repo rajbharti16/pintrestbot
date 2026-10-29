@@ -41,7 +41,15 @@ class Tg:
         self.http = httpx.AsyncClient(timeout=httpx.Timeout(180, connect=15))
 
     async def call(self, method: str, file=None, **params):
-        for attempt in (1, 2):
+        # Agar original message delete ho chuka ho to bhi bot normal message bhej de
+        rp = params.get("reply_parameters")
+        if isinstance(rp, dict) and "allow_sending_without_reply" not in rp:
+            params["reply_parameters"] = {**rp, "allow_sending_without_reply": True}
+
+        stripped = False        # color/icon fields hata diye?
+        dropped_reply = False   # reply_parameters hata diye?
+
+        while True:
             data = {
                 k: (json.dumps(v) if isinstance(v, (dict, list)) else v)
                 for k, v in params.items()
@@ -58,8 +66,24 @@ class Tg:
             if js.get("ok"):
                 return js["result"]
 
-            markup = params.get("reply_markup")
-            if attempt == 1 and r.status_code == 400 and isinstance(markup, dict):
-                _strip(markup)  # retry without color/icon fields
-                continue
-            raise TgError(js.get("description", "unknown error"))
+            desc = js.get("description", "unknown error")
+
+            if r.status_code == 400:
+                # Safety net: reply wala message na mile to bina reply ke dobara bhejo
+                if (
+                    not dropped_reply
+                    and "reply_parameters" in params
+                    and "replied not found" in desc.lower()
+                ):
+                    params.pop("reply_parameters", None)
+                    dropped_reply = True
+                    continue
+
+                # Purana behaviour: color/icon fields hata ke retry
+                markup = params.get("reply_markup")
+                if not stripped and isinstance(markup, dict):
+                    _strip(markup)
+                    stripped = True
+                    continue
+
+            raise TgError(desc)
