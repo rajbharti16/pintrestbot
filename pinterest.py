@@ -1,306 +1,380 @@
+"""
+Instagram downloader for the existing Telegram bot.
+
+Primary: RiteshYT API (API_URL + API_KEY environment variables)
+Fallback: yt-dlp for publicly accessible Instagram posts/reels.
+
+No Instagram login session, cookies, or session watchdog is required.
+"""
+
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 import os
 import re
 import shutil
+import time
 from dataclasses import dataclass
-from urllib.parse import urljoin
+from pathlib import Path
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 import httpx
 
-from config import MAX_FILE_MB
+log = logging.getLogger("pinbot.instagram")
 
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+# Set these as environment variables. Do not hard-code your API key.
+API_URL = os.getenv("API_URL", "https://api.riteshyt.in").rstrip("/")
+API_KEY = os.getenv("API_KEY", "").strip()
+
+IG_RE = re.compile(
+    r"https?://(?:www\.|m\.|)?instagram\.com/"
+    r"(?:reel|reels|p|tv|stories)/[^\s<>\]\[\"']+",
+    re.IGNORECASE,
 )
 
-PIN_RE = re.compile(
-    r"https?://(?:[\w-]+\.)?pinterest\.[a-z.]+/pin/[^\s]+|https?://pin\.it/[\w-]+",
-    re.I,
-)
-ID_RE = re.compile(r"/pin/(?:[^/\s?]*--)?(\d+)")
-VIDEO_PREF = ["V_720P", "V_EXP7", "V_EXP6", "V_EXP5", "V_EXP4", "V_EXP3", "V_360P"]
+class IGError(Exception):
+    """Instagram download or API error."""
 
-
-log = logging.getLogger("pinbot")
-
-HDRS = {"User-Agent": UA, "Referer": "https://www.pinterest.com/", "Accept": "*/*"}
-
-
-class PinError(Exception):
-    pass
-
+class IGSessionError(IGError):
+    """Legacy compatibility only; this module does not use Instagram sessions."""
 
 @dataclass
-class Media:
-    kind: str  # video | photo | gif
+class IGItem:
+    path: str
+    kind: str  # "video" or "photo"
+
+@dataclass
+class IGResult:
     url: str
     title: str
-    pin_url: str
+    total: int
+    items: list[IGItem]
 
 
-async def _resolve_id(client: httpx.AsyncClient, url: str) -> str:
-    m = ID_RE.search(url)
-    if not m:  # pin.it short link -> follow redirects
-        r = await client.get(url, follow_redirects=True)
-        m = ID_RE.search(str(r.url))
-    if not m:
-        raise PinError("Valid Pinterest pin link nahi mila.")
-    return m.group(1)
-
-
-async def _pick_video(client: httpx.AsyncClient, vl: dict):
-    for key in VIDEO_PREF:
-        if key in vl and vl[key].get("url", "").endswith(".mp4"):
-            return vl[key]["url"]
-    for v in vl.values():
-        if v.get("url", "").endswith(".mp4"):
-            return v["url"]
-    for v in vl.values():  # only HLS available
-        u = v.get("url", "")
-        if u.endswith(".m3u8"):
-            guess = u.replace("/hls/", "/720p/").replace(".m3u8", ".mp4")
-            try:
-                r = await client.get(
-                    guess,
-                    headers={"User-Agent": UA, "Range": "bytes=0-1",
-                             "Referer": "https://www.pinterest.com/"},
-                )
-                if r.status_code in (200, 206):
-                    return guess
-            except httpx.HTTPError:
-                pass
-            return u  # ffmpeg will convert this
+def set_dead_hook(_hook):
+    """Legacy compatibility: no session-expiry hook is used."""
     return None
 
 
-IMG_OK = (".jpg", ".jpeg", ".png", ".gif", ".webp")
-
-
-def _pick_image(images: dict):
-    orig = (images.get("orig") or {}).get("url", "")
-    if orig.lower().endswith(IMG_OK):
-        return orig
-    # original is .heic etc. -> take the largest jpg/png variant instead
-    cands = [v for v in images.values() if v.get("url", "").lower().endswith(IMG_OK)]
-    cands.sort(key=lambda v: v.get("width", 0), reverse=True)
-    if cands:
-        return cands[0]["url"]
-    if orig:
-        return re.sub(r"\.\w+$", ".jpg", orig)
+async def watchdog_once():
+    """Legacy compatibility: session watchdog removed; intentionally does nothing."""
     return None
 
 
-def _ffmpeg_exe() -> str:
-    exe = shutil.which("ffmpeg")
-    if exe:
-        return exe
-    try:  # bundled binary from pip (works on Heroku without buildpack)
-        import imageio_ffmpeg
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:
-        raise PinError("ffmpeg available nahi hai (pip install imageio-ffmpeg).")
+def _clean_url(url: str) -> str:
+    url = (url or "").strip().rstrip(".,!?);]")
+    if not IG_RE.search(url):
+        raise IGError("Valid Instagram Reel/Post link bhejo.")
+    return url
 
 
-def _find_video_list(data: dict):
-    if (data.get("videos") or {}).get("video_list"):
-        return data["videos"]["video_list"]
-    for page in (data.get("story_pin_data") or {}).get("pages", []):
-        for block in page.get("blocks", []):
-            vl = (block.get("video") or {}).get("video_list")
-            if vl:
-                return vl
+def _walk_dicts(obj):
+    """Yield dictionaries nested in a JSON response, without assuming one schema."""
+    if isinstance(obj, dict):
+        yield obj
+        for value in obj.values():
+            if isinstance(value, (dict, list)):
+                yield from _walk_dicts(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            if isinstance(value, (dict, list)):
+                yield from _walk_dicts(value)
+
+
+def _first_value(objects, keys):
+    for obj in objects:
+        for key in keys:
+            value = obj.get(key)
+            if value not in (None, "", [], {}):
+                return value
     return None
 
 
-async def _via_api(client, pid: str):
-    params = {
-        "source_url": f"/pin/{pid}/",
-        "data": json.dumps({"options": {"id": pid, "field_set_key": "detailed"}, "context": {}}),
-    }
-    headers = {
-        "User-Agent": UA,
-        "Accept": "application/json",
-        "X-Requested-With": "XMLHttpRequest",
-        "X-Pinterest-PWS-Handler": "www/pin/[id].js",
-    }
-    r = await client.get(
-        "https://www.pinterest.com/resource/PinResource/get/",
-        params=params, headers=headers,
-    )
-    data = r.json()["resource_response"]["data"]
-    title = data.get("title") or data.get("grid_title") or ""
-
-    vl = _find_video_list(data)
-    if vl:
-        url = await _pick_video(client, vl)
-        if url:
-            return Media("video", url, title, f"https://www.pinterest.com/pin/{pid}/")
-
-    img_url = _pick_image(data.get("images") or {})
-    if img_url:
-        kind = "gif" if img_url.lower().endswith(".gif") else "photo"
-        return Media(kind, img_url, title, f"https://www.pinterest.com/pin/{pid}/")
+def _normalize_media_url(value):
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if value.startswith("//"):
+        return "https:" + value
+    if value.startswith("/"):
+        return urljoin(API_URL + "/", value.lstrip("/"))
+    if value.startswith(("https://", "http://")):
+        return value
     return None
 
 
-async def _via_html(client, pid: str):
-    pin_url = f"https://www.pinterest.com/pin/{pid}/"
-    html = (await client.get(pin_url, headers={"User-Agent": UA})).text
-    mp4 = re.search(r"https://v\d*\.pinimg\.com/videos/[^\"\\\s]+?\.mp4", html)
-    t = re.search(r'<meta property="og:title" content="([^"]*)"', html)
-    title = t.group(1) if t else ""
-    if mp4:
-        return Media("video", mp4.group(0), title, pin_url)
-    img = re.search(r'<meta property="og:image" content="([^"]+)"', html)
-    if img:
-        url = re.sub(r"/\d+x/", "/originals/", img.group(1))
-        kind = "gif" if url.endswith(".gif") else "photo"
-        return Media(kind, url, title, pin_url)
-    return None
+def _media_urls(payload):
+    """
+    Extract common media URL shapes from API responses.
+    Supports `download_url`, `url`, `video_url`, `image_url`, `media`,
+    `items`, `carousel_media`, `media_urls`, and nested `data` objects.
+    """
+    found = []
+    seen = set()
+    objects = list(_walk_dicts(payload))
+
+    # Prefer explicit carousel/item arrays when supplied by the API.
+    for obj in objects:
+        for key in ("items", "media", "carousel_media", "media_urls", "resources", "results"):
+            value = obj.get(key)
+            if isinstance(value, list):
+                for entry in value:
+                    if isinstance(entry, str):
+                        candidate = _normalize_media_url(entry)
+                        if candidate:
+                            found.append((candidate, ""))
+                    elif isinstance(entry, dict):
+                        nested = list(_walk_dicts(entry))
+                        candidate = _first_value(nested, (
+                            "download_url", "video_url", "videoUrl", "image_url",
+                            "imageUrl", "display_url", "displayUrl", "media_url",
+                            "mediaUrl", "src", "url", "thumbnail_url",
+                        ))
+                        candidate = _normalize_media_url(candidate)
+                        kind = str(_first_value(nested, ("type", "media_type", "kind")) or "").lower()
+                        if candidate:
+                            found.append((candidate, kind))
+
+    # Single-media response fields.
+    for obj in objects:
+        for key in (
+            "download_url", "video_url", "videoUrl", "image_url", "imageUrl",
+            "display_url", "displayUrl", "media_url", "mediaUrl", "direct_url",
+        ):
+            candidate = _normalize_media_url(obj.get(key))
+            if candidate:
+                kind = str(obj.get("type") or obj.get("media_type") or obj.get("kind") or "").lower()
+                found.append((candidate, kind))
+
+    # `url` is accepted only if it looks like a media/stream URL, not the original IG page.
+    for obj in objects:
+        candidate = _normalize_media_url(obj.get("url"))
+        if candidate:
+            parsed = urlparse(candidate)
+            if any(x in parsed.path.lower() for x in (".mp4", ".jpg", ".jpeg", ".png", ".webp", ".m4v", "/stream")):
+                kind = str(obj.get("type") or obj.get("media_type") or obj.get("kind") or "").lower()
+                found.append((candidate, kind))
+
+    for candidate, kind in found:
+        if candidate not in seen:
+            seen.add(candidate)
+            yield candidate, kind
 
 
-async def fetch_media(link: str) -> Media:
-    async with httpx.AsyncClient(timeout=30, headers={"User-Agent": UA}) as client:
-        pid = await _resolve_id(client, link)
-        media = None
+def _add_api_key_to_stream(url: str) -> str:
+    """Some API stream routes also require the same API key."""
+    parsed = urlparse(url)
+    api_host = urlparse(API_URL).netloc
+    if parsed.netloc and parsed.netloc != api_host:
+        return url
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if API_KEY and not query.get("api_key"):
+        query["api_key"] = [API_KEY]
+        parsed = parsed._replace(query=urlencode(query, doseq=True))
+    return urlunparse(parsed)
+
+
+def _suffix_from_url(url: str, content_type: str = "") -> str:
+    path = urlparse(url).path.lower()
+    for ext in (".mp4", ".m4v", ".mov", ".webm", ".jpg", ".jpeg", ".png", ".webp", ".gif"):
+        if path.endswith(ext):
+            return ext
+    ctype = (content_type or "").split(";", 1)[0].lower()
+    return {
+        "video/mp4": ".mp4",
+        "video/quicktime": ".mov",
+        "video/webm": ".webm",
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+    }.get(ctype, ".mp4")
+
+
+async def _download_url(client: httpx.AsyncClient, url: str, folder: str, index: int):
+    url = _add_api_key_to_stream(url)
+    try:
+        async with client.stream("GET", url, follow_redirects=True, timeout=90) as response:
+            response.raise_for_status()
+            ctype = response.headers.get("content-type", "")
+            # If the endpoint returned JSON/HTML instead of media, report a useful error.
+            if "application/json" in ctype.lower() or "text/html" in ctype.lower():
+                body = (await response.aread())[:500].decode("utf-8", "replace")
+                raise IGError(f"API media endpoint ne file ke bajaye response diya: {body[:250]}")
+            suffix = _suffix_from_url(url, ctype)
+            path = os.path.join(folder, f"instagram_{index}{suffix}")
+            with open(path, "wb") as out:
+                async for chunk in response.aiter_bytes():
+                    out.write(chunk)
+        if not os.path.exists(path) or os.path.getsize(path) < 128:
+            raise IGError("Instagram se empty ya invalid media file mili.")
+        kind = "photo" if suffix in (".jpg", ".jpeg", ".png", ".webp") else "video"
+        return IGItem(path=path, kind=kind)
+    except httpx.HTTPStatusError as exc:
+        raise IGError(f"Media download HTTP {exc.response.status_code}; API stream URL/access check karo.") from exc
+    except httpx.HTTPError as exc:
+        raise IGError(f"Media download network error: {exc}") from exc
+
+
+async def _api_download(link: str, folder: str, all_slides: bool) -> IGResult:
+    if not API_KEY:
+        raise IGError("API_KEY environment variable set nahi hai.")
+    endpoint = f"{API_URL}/api/platform/extract"
+    timeout = httpx.Timeout(45.0, connect=15.0)
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; MediaDownloader/1.0)"}
+
+    async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
         try:
-            media = await _via_api(client, pid)
-        except Exception:
-            pass
-        if not media:
-            media = await _via_html(client, pid)
-        if not media:
-            raise PinError("Is pin me koi video/photo nahi mila (private ya delete ho sakta hai).")
-        return media
-
-
-async def _stream_to(client, url: str, path: str, limit: int) -> bool:
-    size = 0
-    async with client.stream("GET", url, headers=HDRS) as r:
-        if r.status_code != 200:
-            log.warning("direct download %s -> HTTP %s", url, r.status_code)
-            return False
-        with open(path, "wb") as f:
-            async for chunk in r.aiter_bytes(256 * 1024):
-                size += len(chunk)
-                if size > limit:
-                    raise PinError(f"File {MAX_FILE_MB}MB se badi hai, Telegram bot bhej nahi sakta.")
-                f.write(chunk)
-    return size > 0
-
-
-async def _run_ffmpeg(src: str, path: str, audio_fix: bool, remote: bool):
-    cmd = [_ffmpeg_exe(), "-y", "-loglevel", "error"]
-    if remote:
-        cmd += ["-user_agent", UA, "-headers", "Referer: https://www.pinterest.com/\r\n"]
-    cmd += ["-i", src, "-c", "copy"]
-    if audio_fix:
-        cmd += ["-bsf:a", "aac_adtstoasc"]
-    cmd.append(path)
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
-    )
-    _, err = await proc.communicate()
-    ok = proc.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 0
-    return ok, f"rc={proc.returncode} {err.decode(errors='ignore').strip()}"
-
-
-async def _hls_to_file(client, url: str, path: str, limit: int) -> bool:
-    """Download an HLS playlist's segments into one file (pure Python)."""
-    r = await client.get(url, headers=HDRS)
-    log.info("m3u8 %s -> HTTP %s (%d bytes)", url, r.status_code, len(r.content))
-    if r.status_code != 200:
-        log.warning("m3u8 body: %s", r.text[:200])
-        return False
-    text = r.text
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-
-    if any(l.startswith("#EXT-X-STREAM-INF") for l in lines):  # master playlist
-        best, best_bw = None, -1
-        for i, l in enumerate(lines):
-            if l.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
-                m = re.search(r"BANDWIDTH=(\d+)", l)
-                bw = int(m.group(1)) if m else 0
-                if bw > best_bw:
-                    best, best_bw = lines[i + 1], bw
-        return bool(best) and await _hls_to_file(client, urljoin(url, best), path, limit)
-
-    segs = [urljoin(url, l) for l in lines if not l.startswith("#")]
-    if not segs:
-        return False
-    init = re.search(r'#EXT-X-MAP:URI="([^"]+)"', text)
-    size = 0
-    with open(path, "wb") as f:
-        if init:
-            ri = await client.get(urljoin(url, init.group(1)), headers=HDRS)
-            if ri.status_code != 200:
-                return False
-            f.write(ri.content)
-        for i in range(0, len(segs), 8):
-            resps = await asyncio.gather(
-                *(client.get(s, headers=HDRS) for s in segs[i:i + 8])
+            response = await client.get(
+                endpoint,
+                params={"url": link, "api_key": API_KEY},
             )
-            for rr in resps:
-                if rr.status_code != 200:
-                    log.warning("segment HTTP %s", rr.status_code)
-                    return False
-                size += len(rr.content)
-                if size > limit:
-                    raise PinError(f"File {MAX_FILE_MB}MB se badi hai, Telegram bot bhej nahi sakta.")
-                f.write(rr.content)
-    return size > 0
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code
+            if code in (401, 403):
+                raise IGError("Instagram API ne key/access reject kiya (HTTP 401/403).") from exc
+            if code == 429:
+                raise IGError("Instagram API rate limit (HTTP 429); thodi der baad try karo.") from exc
+            raise IGError(f"Instagram API HTTP {code}.") from exc
+        except httpx.HTTPError as exc:
+            raise IGError(f"Instagram API connect nahi hua: {exc}") from exc
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise IGError("Instagram API ne valid JSON response nahi diya.") from exc
+
+        objects = list(_walk_dicts(payload))
+        success = _first_value(objects, ("success", "ok"))
+        if success is False:
+            message = _first_value(objects, ("message", "detail", "error", "reason"))
+            raise IGError(f"Instagram API: {str(message or 'request failed')[:300]}")
+
+        title = str(_first_value(objects, ("title", "caption", "description", "shortcode")) or "Instagram media")
+        canonical = str(_first_value(objects, ("permalink", "canonical_url", "post_url")) or link)
+        total_value = _first_value(objects, ("total", "media_count", "carousel_count", "count"))
+        try:
+            total = max(1, int(total_value))
+        except (TypeError, ValueError):
+            total = 1
+
+        media = list(_media_urls(payload))
+        if not media:
+            message = _first_value(objects, ("message", "detail", "error", "reason"))
+            raise IGError(f"API response mein media URL nahi mila. {str(message or '')[:200]}")
+
+        # For the bot's "All photos" button, return only the first item initially.
+        if not all_slides and total > 1:
+            media = media[:1]
+
+        items = []
+        for i, (url, kind_hint) in enumerate(media, 1):
+            item = await _download_url(client, url, folder, i)
+            if kind_hint in ("image", "photo", "picture"):
+                item.kind = "photo"
+            elif kind_hint in ("video", "reel", "animation"):
+                item.kind = "video"
+            items.append(item)
+
+        if not items:
+            raise IGError("Instagram API se koi media download nahi hui.")
+        return IGResult(url=canonical, title=title, total=max(total, len(items)), items=items)
 
 
-def _mp4_candidates(m3u8: str):
-    stem = re.sub(r"\.m3u8.*$", "", m3u8)
-    stem = re.sub(r"_\w+$", "", stem)  # drop quality suffix if any
-    out = []
-    for folder in ("expMp4", "720p"):
-        base = stem.replace("/hls/", f"/{folder}/")
-        for sfx in ("_720w", "_t1", "_t3", ""):
-            out.append(f"{base}{sfx}.mp4")
-    return out
+def _yt_dlp_worker(link: str, folder: str, all_slides: bool):
+    """Synchronous yt-dlp worker, run in a thread so the bot event loop stays responsive."""
+    try:
+        import yt_dlp
+    except ImportError as exc:
+        raise IGError("Fallback ke liye yt-dlp install nahi hai (pip install yt-dlp).") from exc
+
+    opts = {
+        "outtmpl": os.path.join(folder, "%(id)s_%(autonumber)03d.%(ext)s"),
+        "format": "best[ext=mp4]/best",
+        "noplaylist": not all_slides,
+        "quiet": True,
+        "no_warnings": True,
+        "ignoreerrors": False,
+        "retries": 2,
+        "fragment_retries": 2,
+        "socket_timeout": 25,
+        "restrictfilenames": True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(link, download=True)
+            if not info:
+                raise IGError("yt-dlp ko public Instagram media nahi mili.")
+            entries = info.get("entries")
+            leaf_infos = [x for x in entries if x] if isinstance(entries, list) else [info]
+            if not all_slides and leaf_infos:
+                leaf_infos = leaf_infos[:1]
+
+            files = []
+            seen = set()
+            for entry in leaf_infos:
+                candidates = []
+                for req in entry.get("requested_downloads") or []:
+                    if req.get("filepath"):
+                        candidates.append(req["filepath"])
+                if entry.get("_filename"):
+                    candidates.append(entry["_filename"])
+                try:
+                    candidates.append(ydl.prepare_filename(entry))
+                except Exception:
+                    pass
+                for candidate in candidates:
+                    candidate = os.path.abspath(candidate)
+                    if candidate not in seen and os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                        seen.add(candidate)
+                        files.append((candidate, entry))
+                        break
+
+            # Fallback if yt-dlp reports filenames differently for a particular version.
+            if not files:
+                for p in sorted(Path(folder).iterdir()):
+                    if p.is_file() and p.stat().st_size > 0 and p.suffix.lower() not in (".json", ".jpg.part", ".mp4.part"):
+                        files.append((str(p), info))
+
+            if not files:
+                raise IGError("yt-dlp ne download complete kiya, lekin file locate nahi hui.")
+
+            result = []
+            for path, entry in files:
+                ext = Path(path).suffix.lower()
+                kind = "photo" if ext in (".jpg", ".jpeg", ".png", ".webp") else "video"
+                result.append(IGItem(path=path, kind=kind))
+            title = str(info.get("title") or info.get("description") or "Instagram media")
+            total = int(info.get("playlist_count") or info.get("n_entries") or len(result) or 1)
+            return IGResult(url=link, title=title, total=max(total, len(result)), items=result)
+    except IGError:
+        raise
+    except Exception as exc:
+        message = str(exc).replace("\n", " ")[:350]
+        raise IGError(f"API aur yt-dlp fallback dono fail hue. yt-dlp: {message}") from exc
 
 
-async def download(media: Media, folder: str) -> str:
-    limit = MAX_FILE_MB * 1024 * 1024
+async def fetch_instagram(url: str, folder: str, all_slides: bool = False) -> IGResult:
+    """
+    Drop-in replacement for the existing bot's fetch_instagram().
+    Tries the configured API first, then yt-dlp for public posts/reels.
+    """
+    link = _clean_url(url)
+    os.makedirs(folder, exist_ok=True)
+    api_error = None
+    try:
+        return await _api_download(link, folder, all_slides)
+    except Exception as exc:
+        api_error = exc
+        log.warning("Instagram API failed; trying yt-dlp fallback (%s)", exc)
 
-    if media.url.endswith(".m3u8"):
-        path = os.path.join(folder, "pin.mp4")
-        raw = os.path.join(folder, "pin_raw.ts")
-
-        async with httpx.AsyncClient(timeout=120) as client:
-            # 1) direct mp4 variants (no conversion needed)
-            for cand in _mp4_candidates(media.url):
-                if await _stream_to(client, cand, path, limit):
-                    return path
-
-            # 2) download HLS segments in Python, remux locally with ffmpeg
-            if await _hls_to_file(client, media.url, raw, limit):
-                last = ""
-                for audio_fix in (True, False):
-                    ok, last = await _run_ffmpeg(raw, path, audio_fix, remote=False)
-                    if ok:
-                        return path
-                    log.error("ffmpeg remux failed (audio_fix=%s): %s", audio_fix, last)
-                raise PinError(f"Video convert nahi ho paya: {last[:150]}")
-
-        # 3) last resort: let ffmpeg fetch the URL itself
-        ok, last = await _run_ffmpeg(media.url, path, True, remote=True)
-        if ok:
-            return path
-        log.error("ffmpeg remote failed: %s", last)
-        raise PinError(f"Video download nahi ho paya: {last[:150]}")
-
-    ext = os.path.splitext(media.url.split("?")[0])[1].lower()
-    if ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4"):
-        ext = {"video": ".mp4", "photo": ".jpg", "gif": ".gif"}[media.kind]
-    path = os.path.join(folder, "pin" + ext)
-
-    async with httpx.AsyncClient(timeout=120) as client:
-        if not await _stream_to(client, media.url, path, limit):
-            raise PinError("Media download fail ho gaya.")
-    return path
+    try:
+        return await asyncio.to_thread(_yt_dlp_worker, link, folder, all_slides)
+    except Exception as fallback_error:
+        raise IGError(
+            f"API failed: {str(api_error)[:180]} | Public yt-dlp fallback failed: "
+            f"{str(fallback_error)[:220]}"
+        ) from fallback_error
