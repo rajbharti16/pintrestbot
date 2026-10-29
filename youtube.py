@@ -39,8 +39,8 @@ MAX_MIN = int(os.getenv("YT_MAX_MIN", "60"))
 # Files above 50MB are downloaded (up to this size) and sent in parts
 # Download API (same idea as a music bot's YouTube.py). Heroku Config Vars:
 #   API_URL=https://your-api-host      API_KEY=your-key
-API_URL = os.getenv("API_URL", "").strip().rstrip("/")
-API_KEY = os.getenv("API_KEY", "").strip()
+API_URL = os.getenv("API_URL", "https://api.riteshyt.in").strip().rstrip("/")
+API_KEY = os.getenv("API_KEY", "riteshfreee0aac51ec0bc9720157ffc57").strip()
 BIG_MAX_MB = int(os.getenv("YT_BIG_MAX_MB", "1000" if (API_ID and API_HASH) else "300"))
 
 FORMATS = {"v360": 360, "v720": 720, "mp3": 0}
