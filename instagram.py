@@ -5,7 +5,7 @@ Flow:
   - Public reel / post / tv  -> yt-dlp first (free), API fallback if it fails
   - Stories / highlights     -> directly API (yt-dlp needs login for these)
 
-API: RiteshYT (API_URL + API_KEY environment variables)
+API: api.riteshyt.in  (API_URL + API_KEY environment variables)
 No Instagram login session or cookies required.
 """
 
@@ -23,9 +23,11 @@ import httpx
 
 log = logging.getLogger("pinbot.instagram")
 
-# Set these as environment variables. Do not hard-code your API key.
-API_URL = os.getenv("API_URL", "https://api.riteshyt.in").rstrip("/")
+# Config Vars: API_URL, API_KEY. Key ko code me hard-code mat karo.
+API_URL = os.getenv("API_URL", "https://api.riteshyt.in").strip().rstrip("/")
 API_KEY = os.getenv("API_KEY", "riteshfreee0aac51ec0bc9720157ffc57").strip()
+
+MAX_STORY_ITEMS = 10
 
 IG_RE = re.compile(
     r"https?://(?:www\.|m\.)?instagram\.com/"
@@ -34,8 +36,10 @@ IG_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Stories / highlights / share-links of highlights -> API only
+# Stories / highlights -> API only
 API_ONLY_RE = re.compile(r"instagram\.com/(?:stories/|s/)", re.IGNORECASE)
+
+IMG_EXT = (".jpg", ".jpeg", ".png", ".webp")
 
 
 class IGError(Exception):
@@ -71,17 +75,17 @@ async def watchdog_once():
 
 
 def _clean_url(url: str) -> str:
-    url = (url or "").strip().rstrip(".,!?);]")
-    if not IG_RE.search(url):
+    m = IG_RE.search((url or "").strip())
+    if not m:
         raise IGError("Valid Instagram Reel/Post/Story link bhejo.")
-    return url
+    return m.group(0).rstrip(".,!?);]")
 
 
 # ---------------------------------------------------------------------------
-# yt-dlp (primary for public reels / posts)
+# 1) yt-dlp (primary for public reels / posts)
 # ---------------------------------------------------------------------------
 def _yt_dlp_worker(link: str, folder: str, all_slides: bool) -> IGResult:
-    """Synchronous yt-dlp worker, run in a thread so the bot event loop stays responsive."""
+    """Sync yt-dlp worker; runs in a thread so the bot event loop stays free."""
     try:
         import yt_dlp
     except ImportError as exc:
@@ -94,9 +98,10 @@ def _yt_dlp_worker(link: str, folder: str, all_slides: bool) -> IGResult:
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": False,
-        "retries": 2,
-        "fragment_retries": 2,
-        "socket_timeout": 25,
+        "retries": 1,
+        "extractor_retries": 1,
+        "fragment_retries": 1,
+        "socket_timeout": 15,
         "restrictfilenames": True,
     }
     try:
@@ -109,8 +114,7 @@ def _yt_dlp_worker(link: str, folder: str, all_slides: bool) -> IGResult:
             if not all_slides and leaf_infos:
                 leaf_infos = leaf_infos[:1]
 
-            files = []
-            seen = set()
+            files, seen = [], set()
             for entry in leaf_infos:
                 candidates = []
                 for req in entry.get("requested_downloads") or []:
@@ -122,41 +126,38 @@ def _yt_dlp_worker(link: str, folder: str, all_slides: bool) -> IGResult:
                     candidates.append(ydl.prepare_filename(entry))
                 except Exception:
                     pass
-                for candidate in candidates:
-                    candidate = os.path.abspath(candidate)
-                    if candidate not in seen and os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
-                        seen.add(candidate)
-                        files.append((candidate, entry))
+                for cand in candidates:
+                    cand = os.path.abspath(cand)
+                    if cand not in seen and os.path.isfile(cand) and os.path.getsize(cand) > 0:
+                        seen.add(cand)
+                        files.append(cand)
                         break
 
             if not files:
                 for p in sorted(Path(folder).iterdir()):
                     if p.is_file() and p.stat().st_size > 0 and p.suffix.lower() not in (".json", ".part"):
-                        files.append((str(p), info))
-
+                        files.append(str(p))
             if not files:
                 raise IGError("yt-dlp ne download kiya, lekin file locate nahi hui.")
 
-            result = []
-            for path, _entry in files:
-                ext = Path(path).suffix.lower()
-                kind = "photo" if ext in (".jpg", ".jpeg", ".png", ".webp") else "video"
-                result.append(IGItem(path=path, kind=kind))
+            result = [
+                IGItem(path=p, kind="photo" if Path(p).suffix.lower() in IMG_EXT else "video")
+                for p in files
+            ]
             title = str(info.get("title") or info.get("description") or "Instagram media")
             total = int(info.get("playlist_count") or info.get("n_entries") or len(result) or 1)
             return IGResult(url=link, title=title, total=max(total, len(result)), items=result)
     except IGError:
         raise
     except Exception as exc:
-        message = str(exc).replace("\n", " ")[:350]
-        raise IGError(f"yt-dlp fail: {message}") from exc
+        raise IGError(f"yt-dlp fail: {str(exc).replace(chr(10), ' ')[:300]}") from exc
 
 
 # ---------------------------------------------------------------------------
-# RiteshYT API (fallback + stories / highlights)
+# 2) API (fallback + stories / highlights)
 # ---------------------------------------------------------------------------
 def _walk_dicts(obj):
-    """Yield dictionaries nested in a JSON response, without assuming one schema."""
+    """Yield every dict nested in a JSON response (parents before children)."""
     if isinstance(obj, dict):
         yield obj
         for value in obj.values():
@@ -190,62 +191,93 @@ def _normalize_media_url(value):
     return None
 
 
-def _media_urls(payload):
-    """Extract common media URL shapes from API responses (carousel, stories, single media)."""
-    found = []
-    seen = set()
+def _looks_media(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    return any(x in path for x in (".mp4", ".m4v", ".jpg", ".jpeg", ".png", ".webp", "/stream", "/download"))
+
+
+_LIST_KEYS = ("items", "media", "carousel_media", "media_urls", "resources", "results", "stories", "medias")
+_DIRECT_KEYS = (
+    "download_url", "video_url", "videoUrl", "image_url", "imageUrl",
+    "display_url", "displayUrl", "media_url", "mediaUrl", "direct_url", "src",
+)
+
+
+def _entry_url(entry, allow_plain_url: bool):
+    """(url, kind_hint) from a dict/str entry."""
+    if isinstance(entry, str):
+        return _normalize_media_url(entry), ""
+    if not isinstance(entry, dict):
+        return None, ""
+    kind = str(entry.get("type") or entry.get("media_type") or entry.get("kind") or "").lower()
+    for key in _DIRECT_KEYS:
+        url = _normalize_media_url(entry.get(key))
+        if url:
+            return url, kind
+    if allow_plain_url:
+        url = _normalize_media_url(entry.get("url"))
+        if url and _looks_media(url):
+            return url, kind
+    return None, ""
+
+
+def _quality_num(value) -> int:
+    m = re.search(r"\d+", str(value or ""))
+    return int(m.group()) if m else 0
+
+
+def _media_urls(payload) -> list:
+    """Returns [(url, kind_hint), ...]. Single reel -> exactly one item."""
     objects = list(_walk_dicts(payload))
 
+    # 1) carousel / stories lists
     for obj in objects:
-        for key in ("items", "media", "carousel_media", "media_urls", "resources", "results", "stories"):
+        for key in _LIST_KEYS:
             value = obj.get(key)
-            if isinstance(value, list):
+            if isinstance(value, list) and value:
+                out, seen = [], set()
                 for entry in value:
-                    if isinstance(entry, str):
-                        candidate = _normalize_media_url(entry)
-                        if candidate:
-                            found.append((candidate, ""))
-                    elif isinstance(entry, dict):
-                        nested = list(_walk_dicts(entry))
-                        candidate = _first_value(nested, (
-                            "download_url", "video_url", "videoUrl", "image_url",
-                            "imageUrl", "display_url", "displayUrl", "media_url",
-                            "mediaUrl", "src", "url", "thumbnail_url",
-                        ))
-                        candidate = _normalize_media_url(candidate)
-                        kind = str(_first_value(nested, ("type", "media_type", "kind")) or "").lower()
-                        if candidate:
-                            found.append((candidate, kind))
+                    url, kind = _entry_url(entry, allow_plain_url=True)
+                    if url and url not in seen:
+                        seen.add(url)
+                        out.append((url, kind))
+                if out:
+                    return out
 
+    # 2) single media: download_url / video_url / image_url ...
     for obj in objects:
-        for key in (
-            "download_url", "video_url", "videoUrl", "image_url", "imageUrl",
-            "display_url", "displayUrl", "media_url", "mediaUrl", "direct_url",
-        ):
-            candidate = _normalize_media_url(obj.get(key))
-            if candidate:
-                kind = str(obj.get("type") or obj.get("media_type") or obj.get("kind") or "").lower()
-                found.append((candidate, kind))
+        url, kind = _entry_url(obj, allow_plain_url=False)
+        if url:
+            return [(url, kind)]
 
+    # 3) formats list: best video that has audio
     for obj in objects:
-        candidate = _normalize_media_url(obj.get("url"))
-        if candidate:
-            parsed = urlparse(candidate)
-            if any(x in parsed.path.lower() for x in (".mp4", ".jpg", ".jpeg", ".png", ".webp", ".m4v", "/stream")):
-                kind = str(obj.get("type") or obj.get("media_type") or obj.get("kind") or "").lower()
-                found.append((candidate, kind))
+        formats = obj.get("formats")
+        if isinstance(formats, list):
+            best = None
+            for f in formats:
+                if not isinstance(f, dict) or str(f.get("type") or "video").lower() != "video":
+                    continue
+                if f.get("has_audio") is False:
+                    continue
+                url = _normalize_media_url(f.get("url"))
+                if url and (best is None or _quality_num(f.get("quality")) > best[0]):
+                    best = (_quality_num(f.get("quality")), url)
+            if best:
+                return [(best[1], "video")]
 
-    for candidate, kind in found:
-        if candidate not in seen:
-            seen.add(candidate)
-            yield candidate, kind
+    # 4) last resort: plain "url" that looks like media
+    for obj in objects:
+        url, kind = _entry_url(obj, allow_plain_url=True)
+        if url:
+            return [(url, kind)]
+    return []
 
 
 def _add_api_key_to_stream(url: str) -> str:
-    """Some API stream routes also require the same API key."""
+    """API ke apne stream routes ko bhi key chahiye ho sakti hai."""
     parsed = urlparse(url)
-    api_host = urlparse(API_URL).netloc
-    if parsed.netloc and parsed.netloc != api_host:
+    if parsed.netloc and parsed.netloc != urlparse(API_URL).netloc:
         return url
     query = parse_qs(parsed.query, keep_blank_values=True)
     if API_KEY and not query.get("api_key"):
@@ -256,104 +288,109 @@ def _add_api_key_to_stream(url: str) -> str:
 
 def _suffix_from_url(url: str, content_type: str = "") -> str:
     path = urlparse(url).path.lower()
-    for ext in (".mp4", ".m4v", ".mov", ".webm", ".jpg", ".jpeg", ".png", ".webp", ".gif"):
+    for ext in (".mp4", ".m4v", ".mov", ".webm") + IMG_EXT + (".gif",):
         if path.endswith(ext):
             return ext
     ctype = (content_type or "").split(";", 1)[0].lower()
     return {
-        "video/mp4": ".mp4",
-        "video/quicktime": ".mov",
-        "video/webm": ".webm",
-        "image/jpeg": ".jpg",
-        "image/png": ".png",
-        "image/webp": ".webp",
-        "image/gif": ".gif",
-    }.get(ctype, ".mp4")
+        "video/mp4": ".mp4", "video/quicktime": ".mov", "video/webm": ".webm",
+        "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif",
+    }.get(ctype, "")
 
 
-async def _download_url(client: httpx.AsyncClient, url: str, folder: str, index: int) -> IGItem:
+async def _download_url(client: httpx.AsyncClient, url: str, folder: str, index: int, hint: str) -> IGItem:
     url = _add_api_key_to_stream(url)
+    is_photo_hint = hint in ("image", "photo", "picture")
     try:
         async with client.stream("GET", url, follow_redirects=True, timeout=90) as response:
             response.raise_for_status()
             ctype = response.headers.get("content-type", "")
-            if "application/json" in ctype.lower() or "text/html" in ctype.lower():
-                body = (await response.aread())[:500].decode("utf-8", "replace")
-                raise IGError(f"API media endpoint ne file ke bajaye response diya: {body[:250]}")
+            low = ctype.lower()
+            if "json" in low or "text/html" in low:
+                body = (await response.aread())[:300].decode("utf-8", "replace")
+                raise IGError(f"API ne file ke bajaye response diya: {body[:200]}")
             suffix = _suffix_from_url(url, ctype)
+            if not suffix:
+                suffix = ".jpg" if is_photo_hint else ".mp4"
+            elif is_photo_hint and suffix not in IMG_EXT:
+                suffix = ".jpg"
             path = os.path.join(folder, f"instagram_{index}{suffix}")
             with open(path, "wb") as out:
-                async for chunk in response.aiter_bytes():
+                async for chunk in response.aiter_bytes(262144):
                     out.write(chunk)
-        if not os.path.exists(path) or os.path.getsize(path) < 128:
+        if os.path.getsize(path) < 128:
             raise IGError("Empty ya invalid media file mili.")
-        kind = "photo" if suffix in (".jpg", ".jpeg", ".png", ".webp") else "video"
+        kind = "photo" if suffix in IMG_EXT else "video"
+        if hint in ("video", "reel", "animation") and suffix not in IMG_EXT:
+            kind = "video"
         return IGItem(path=path, kind=kind)
     except httpx.HTTPStatusError as exc:
-        raise IGError(f"Media download HTTP {exc.response.status_code}; API stream URL/access check karo.") from exc
+        raise IGError(f"Media download HTTP {exc.response.status_code}.") from exc
     except httpx.HTTPError as exc:
         raise IGError(f"Media download network error: {exc}") from exc
 
 
 async def _api_download(link: str, folder: str, all_slides: bool) -> IGResult:
-    if not API_KEY:
-        raise IGError("API_KEY environment variable set nahi hai.")
-    endpoint = f"{API_URL}/api/platform/extract"
-    timeout = httpx.Timeout(45.0, connect=15.0)
+    params = {"url": link}
+    if API_KEY:
+        params["api_key"] = API_KEY
+    else:
+        log.warning("API_KEY set nahi hai (Heroku Config Vars check karo)")
     headers = {"User-Agent": "Mozilla/5.0 (compatible; MediaDownloader/1.0)"}
 
-    async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=15.0),
+                                 headers=headers, follow_redirects=True) as client:
         try:
-            response = await client.get(endpoint, params={"url": link, "api_key": API_KEY})
+            response = await client.get(f"{API_URL}/api/platform/extract", params=params)
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             code = exc.response.status_code
+            log.warning("API extract HTTP %s: %s", code, exc.response.text[:200])
             if code in (401, 403):
-                raise IGError("Instagram API ne key/access reject kiya (HTTP 401/403).") from exc
+                raise IGError("API key invalid/expire hai (free key 30 din chalti hai), nayi key lo.") from exc
             if code == 429:
-                raise IGError("Instagram API rate limit (HTTP 429); thodi der baad try karo.") from exc
-            raise IGError(f"Instagram API HTTP {code}.") from exc
+                raise IGError("API rate limit (429); thodi der baad try karo.") from exc
+            raise IGError(f"API HTTP {code}.") from exc
         except httpx.HTTPError as exc:
-            raise IGError(f"Instagram API connect nahi hua: {exc}") from exc
+            raise IGError(f"API connect nahi hua: {exc}") from exc
 
         try:
             payload = response.json()
         except ValueError as exc:
-            raise IGError("Instagram API ne valid JSON response nahi diya.") from exc
+            raise IGError("API ne valid JSON nahi diya.") from exc
 
         objects = list(_walk_dicts(payload))
-        success = _first_value(objects, ("success", "ok"))
-        if success is False:
+        if _first_value(objects, ("success", "ok")) is False:
             message = _first_value(objects, ("message", "detail", "error", "reason"))
-            raise IGError(f"Instagram API: {str(message or 'request failed')[:300]}")
+            raise IGError(f"API: {str(message or 'request failed')[:250]}")
 
         title = str(_first_value(objects, ("title", "caption", "description", "shortcode")) or "Instagram media")
         canonical = str(_first_value(objects, ("permalink", "canonical_url", "post_url")) or link)
-        total_value = _first_value(objects, ("total", "media_count", "carousel_count", "count"))
-        try:
-            total = max(1, int(total_value))
-        except (TypeError, ValueError):
-            total = 1
 
-        media = list(_media_urls(payload))
+        media = _media_urls(payload)
         if not media:
             message = _first_value(objects, ("message", "detail", "error", "reason"))
-            raise IGError(f"API response mein media URL nahi mila. {str(message or '')[:200]}")
+            raise IGError(f"API response me media URL nahi mila. {str(message or '')[:150]}")
 
-        if not all_slides and total > 1:
-            media = media[:1]
+        declared = _first_value(objects, ("total", "media_count", "carousel_count"))
+        try:
+            total = max(int(declared), len(media))
+        except (TypeError, ValueError):
+            total = len(media)
 
-        items = []
-        for i, (url, kind_hint) in enumerate(media, 1):
-            item = await _download_url(client, url, folder, i)
-            if kind_hint in ("image", "photo", "picture"):
-                item.kind = "photo"
-            elif kind_hint in ("video", "reel", "animation"):
-                item.kind = "video"
-            items.append(item)
+        if all_slides:
+            media = media[:MAX_STORY_ITEMS]
+        elif len(media) > 1:
+            media = media[:1]  # bot "All photos" button se baaki bhejta hai
 
+        results = await asyncio.gather(
+            *(_download_url(client, url, folder, i, hint) for i, (url, hint) in enumerate(media, 1)),
+            return_exceptions=True,
+        )
+        items = [r for r in results if isinstance(r, IGItem)]
         if not items:
-            raise IGError("Instagram API se koi media download nahi hui.")
+            first_err = next((r for r in results if isinstance(r, Exception)), None)
+            raise IGError(str(first_err) if first_err else "API se koi media download nahi hui.")
         return IGResult(url=canonical, title=title, total=max(total, len(items)), items=items)
 
 
@@ -361,7 +398,7 @@ async def _api_download(link: str, folder: str, all_slides: bool) -> IGResult:
 # Public entry point (same signature the bot already uses)
 # ---------------------------------------------------------------------------
 def _reset_folder(folder: str):
-    """Remove partial files left by a failed attempt so the next one starts clean."""
+    """Failed attempt ki adhoori files hata do."""
     for p in Path(folder).iterdir():
         try:
             if p.is_file():
@@ -374,21 +411,21 @@ async def fetch_instagram(url: str, folder: str, all_slides: bool = False) -> IG
     link = _clean_url(url)
     os.makedirs(folder, exist_ok=True)
 
-    # Stories / highlights: yt-dlp can't do these without login -> API only
+    # Stories / highlights: yt-dlp bina login ke nahi kar sakta -> seedha API
     if API_ONLY_RE.search(link):
-        return await _api_download(link, folder, all_slides)
+        return await _api_download(link, folder, True)
 
-    # Public reel / post: yt-dlp first, API as fallback
+    # Public reel / post: yt-dlp pehle, fail ho to API
     try:
         return await asyncio.to_thread(_yt_dlp_worker, link, folder, all_slides)
     except Exception as exc:
         ytdlp_error = exc
-        log.warning("yt-dlp failed, trying API (%s)", exc)
+        log.warning("yt-dlp failed, trying API (%s)", str(exc)[:200])
 
     _reset_folder(folder)
     try:
         return await _api_download(link, folder, all_slides)
     except Exception as api_error:
         raise IGError(
-            f"yt-dlp: {str(ytdlp_error)[:150]} | API: {str(api_error)[:200]}"
+            f"yt-dlp: {str(ytdlp_error)[:120]} | API: {str(api_error)[:200]}"
         ) from api_error
