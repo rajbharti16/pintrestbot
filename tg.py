@@ -4,6 +4,7 @@ Raw calls are used on purpose: colored buttons (`style`) and premium emoji on
 buttons (`icon_custom_emoji_id`) are new Bot API fields, and many libraries
 don't expose them yet. Here you can pass any field straight through.
 """
+import asyncio
 import json
 
 import httpx
@@ -41,13 +42,14 @@ class Tg:
         self.http = httpx.AsyncClient(timeout=httpx.Timeout(180, connect=15))
 
     async def call(self, method: str, file=None, **params):
-        # Agar original message delete ho chuka ho to bhi bot normal message bhej de
+        # Original message delete ho chuka ho to bhi bot normal message bhej de
         rp = params.get("reply_parameters")
         if isinstance(rp, dict) and "allow_sending_without_reply" not in rp:
             params["reply_parameters"] = {**rp, "allow_sending_without_reply": True}
 
         stripped = False        # color/icon fields hata diye?
         dropped_reply = False   # reply_parameters hata diye?
+        flood_waits = 0
 
         while True:
             data = {
@@ -62,14 +64,24 @@ class Tg:
             else:
                 r = await self.http.post(self.base + method, data=data)
 
-            js = r.json()
+            try:
+                js = r.json()
+            except ValueError:
+                raise TgError(f"Telegram HTTP {r.status_code}: invalid response")
             if js.get("ok"):
                 return js["result"]
 
             desc = js.get("description", "unknown error")
 
+            # Flood wait: thoda ruk ke dobara try
+            if r.status_code == 429 and flood_waits < 2:
+                wait = int((js.get("parameters") or {}).get("retry_after", 3))
+                flood_waits += 1
+                await asyncio.sleep(min(wait, 30))
+                continue
+
             if r.status_code == 400:
-                # Safety net: reply wala message na mile to bina reply ke dobara bhejo
+                # reply wala message na mile to bina reply ke dobara bhejo
                 if (
                     not dropped_reply
                     and "reply_parameters" in params
@@ -79,7 +91,7 @@ class Tg:
                     dropped_reply = True
                     continue
 
-                # Purana behaviour: color/icon fields hata ke retry
+                # color/icon fields hata ke retry
                 markup = params.get("reply_markup")
                 if not stripped and isinstance(markup, dict):
                     _strip(markup)
