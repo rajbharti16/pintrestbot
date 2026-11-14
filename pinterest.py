@@ -192,12 +192,14 @@ async def _stream_to(client, url: str, path: str, limit: int) -> bool:
     return size > 0
 
 
-async def _run_ffmpeg(src: str, path: str, audio_fix: bool, remote: bool):
+async def _run_ffmpeg(src: str, path: str, audio_fix: bool, remote: bool, no_audio: bool = False):
     cmd = [_ffmpeg_exe(), "-y", "-loglevel", "error"]
     if remote:
         cmd += ["-user_agent", UA, "-headers", "Referer: https://www.pinterest.com/\r\n"]
     cmd += ["-i", src, "-c", "copy"]
-    if audio_fix:
+    if no_audio:
+        cmd.append("-an")  # audio track hata do
+    elif audio_fix:
         cmd += ["-bsf:a", "aac_adtstoasc"]
     cmd.append(path)
     proc = await asyncio.create_subprocess_exec(
@@ -265,7 +267,7 @@ def _mp4_candidates(m3u8: str):
     return out
 
 
-async def download(media: Media, folder: str) -> str:
+async def _download_raw(media: Media, folder: str) -> str:
     limit = MAX_FILE_MB * 1024 * 1024
 
     if media.url.endswith(".m3u8"):
@@ -304,3 +306,26 @@ async def download(media: Media, folder: str) -> str:
         if not await _stream_to(client, media.url, path, limit):
             raise PinError("Media download fail ho gaya.")
     return path
+
+
+async def download(media: Media, folder: str, mute: bool = False) -> str:
+    """Media download karta hai. mute=True ho toh video se audio hata deta hai.
+
+    Photo/gif pe mute ka koi asar nahi hota.
+    """
+    path = await _download_raw(media, folder)
+
+    if mute and media.kind == "video" and path.lower().endswith(".mp4"):
+        muted = os.path.join(folder, "pin_muted.mp4")
+        ok, last = await _run_ffmpeg(path, muted, audio_fix=False, remote=False, no_audio=True)
+        if not ok:
+            log.error("ffmpeg mute failed: %s", last)
+            raise PinError(f"Mute video nahi ban paya: {last[:150]}")
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return muted
+
+    return path
+        
