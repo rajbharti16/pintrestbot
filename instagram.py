@@ -32,7 +32,7 @@ log = logging.getLogger("pinbot.instagram")
 
 # Config Vars: API_URL, API_KEY. Key ko code me hard-code mat karo.
 API_URL = os.getenv("API_URL", "https://api.riteshyt.in").strip().rstrip("/")
-API_KEY = os.getenv("API_KEY", "").strip()
+API_KEY = os.getenv("API_KEY", "riteshfreee0aac51ec0bc9720157ffc57").strip()
 
 MAX_STORY_ITEMS = 10
 PHOTO_VIDEO_MAX_SECONDS = 30  # photo + song video ki max length
